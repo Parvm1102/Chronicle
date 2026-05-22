@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import posixpath
 import re
-from html import unescape
+from html import unescape, escape as _escape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -320,73 +320,76 @@ def _resolve_epub_src(document_name: str, src: str, images: dict[str, str]) -> s
 
 def parse_pdf(path: Path) -> ParsedBook:
     import fitz
+    import base64
 
     document = fitz.open(path)
     sections: list[ParsedSection] = []
-    
-    toc = []
-    try:
-        toc = document.get_toc()
-    except Exception:
-        pass
-        
     page_count = document.page_count
     
-    if toc:
-        bookmarks = []
-        for item in toc:
-            if len(item) >= 3 and isinstance(item[2], int) and 1 <= item[2] <= page_count:
-                bookmarks.append((item[1], item[2]))
-        bookmarks.sort(key=lambda x: x[1])
-        
-        # Preface / frontmatter pages before Chapter 1
-        if bookmarks and bookmarks[0][1] > 1:
-            pre_text = []
-            for p in range(0, bookmarks[0][1] - 1):
-                try:
-                    pre_text.append(document.load_page(p).get_text("text"))
-                except Exception:
-                    pass
-            full_pre = _normalize_text("\n".join(pre_text))
-            if full_pre:
-                sections.append(ParsedSection(0, "Opening", full_pre, "pdf:page:1"))
-                
-        # Group text by bookmark ranges
-        for i, (title, start_page) in enumerate(bookmarks):
-            end_page = bookmarks[i + 1][1] if i + 1 < len(bookmarks) else page_count + 1
-            chap_text = []
-            for p in range(start_page - 1, end_page - 1):
-                if p < page_count:
-                    try:
-                        chap_text.append(document.load_page(p).get_text("text"))
-                    except Exception:
-                        pass
-            full_text = _normalize_text("\n".join(chap_text))
-            if full_text:
-                sections.append(
-                    ParsedSection(
-                        index=len(sections),
-                        title=title.strip() or f"Section {len(sections) + 1}",
-                        text=full_text,
-                        source_locator=f"pdf:page:{start_page}",
-                    )
-                )
-    
-    # Fallback to page-by-page if no TOC bookmarks found
-    if not sections:
-        for page_index in range(page_count):
+    for page_index in range(page_count):
+        try:
             page = document.load_page(page_index)
-            text = _normalize_text(page.get_text("text"))
-            if text:
-                sections.append(
-                    ParsedSection(
-                        index=len(sections),
-                        title=f"Page {page_index + 1}",
-                        text=text,
-                        source_locator=f"pdf:page:{page_index + 1}",
-                    )
+            rect = page.rect
+            w, h = rect.width, rect.height
+
+            # Render page at 150 DPI for high visual fidelity
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("jpeg")
+            b64_str = base64.b64encode(img_bytes).decode("utf-8")
+            
+            # Extract plain text of the page for search/TTS
+            plain_text = page.get_text("text")
+            
+            # Extract text blocks with coordinates for interactive selection overlay
+            blocks = page.get_text("blocks")
+            text_layers = []
+            for b in blocks:
+                x0, y0, x1, y1, text, block_no, block_type = b
+                if block_type == 0:  # Text block
+                    escaped_text = _escape(text).replace("\n", "<br>")
+                    bw = x1 - x0
+                    bh = y1 - y0
+                    # Standard responsive font sizing relative to block height
+                    fs = max(7, min(36, bh * 0.85))
+                    text_layers.append(f"""
+                    <div class="pdf-text-layer" style="position:absolute; left:{x0}px; top:{y0}px; width:{bw}px; height:{bh}px; font-size:{fs}px;">
+                      {escaped_text}
+                    </div>
+                    """)
+            
+            text_overlay_html = "".join(text_layers)
+            
+            # Embed native high-fidelity rendering with a transparent interactive text selection overlay
+            html_content = f"""
+            <div class="pdf-page-container" style="position:relative; width:{w}px; height:{h}px; margin:0 auto; user-select:text;">
+              <img src="data:image/jpeg;base64,{b64_str}" class="pdf-page-img" alt="Page {page_index + 1}" style="width:100%; height:100%; display:block; pointer-events:none;" />
+              <div class="pdf-text-overlay" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:auto; overflow:hidden;">
+                {text_overlay_html}
+              </div>
+            </div>
+            """
+            
+            sections.append(
+                ParsedSection(
+                    index=page_index,
+                    title=f"Page {page_index + 1}",
+                    text=plain_text,
+                    html=html_content,
+                    source_locator=f"pdf:page:{page_index + 1}",
                 )
-                
+            )
+        except Exception as e:
+            # Fallback for errors
+            sections.append(
+                ParsedSection(
+                    index=page_index,
+                    title=f"Page {page_index + 1}",
+                    text=f"[Error rendering page {page_index + 1}: {e}]",
+                    html=f"<div class='pdf-page-error'><p>Error rendering page {page_index + 1}</p></div>",
+                    source_locator=f"pdf:page:{page_index + 1}",
+                )
+            )
+            
     document.close()
     return ParsedBook(_clean_title(path.stem), "Unknown author", "pdf", sections or [_empty_section()])
 

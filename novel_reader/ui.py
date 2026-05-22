@@ -430,7 +430,17 @@ def _history(state, direction):
 
 
 def _font(state, delta):
-    return _render({**state, "font": max(16, min(32, int(state["font"]) + int(delta)))})
+    novel_id = state.get("novel_id")
+    novel = store.get_novel(novel_id) if novel_id else None
+    is_pdf = novel and novel.get("file_format") == "pdf"
+    
+    if is_pdf:
+        current_zoom = int(state.get("zoom", 100))
+        zoom_change = int(delta) * 10
+        new_zoom = max(50, min(200, current_zoom + zoom_change))
+        return _render({**state, "zoom": new_zoom})
+    else:
+        return _render({**state, "font": max(16, min(32, int(state["font"]) + int(delta)))})
 
 
 def _theme(state, theme):
@@ -558,8 +568,9 @@ def _page(section: dict | None, count: int, state: dict) -> str:
         content = _highlight_phrases(content, bookmarks, "bookmark-dotted")
         content = _highlight_phrases(content, lookups, "define-dotted")
 
+    zoom_val = state.get("zoom", 100) / 100.0
     return f"""
-    <article class="page theme-{state['theme']}" style="--font:{state['font']}px">
+    <article class="page theme-{state['theme']}" style="--font:{state['font']}px; --pdf-zoom:{zoom_val}">
       <div class="progress"><span style="width:{progress}%"></span></div>
       <div class="text">{content}</div>
     </article>
@@ -593,16 +604,31 @@ def _settings_panel(novel_id: int | None, state: dict) -> str:
     if not bookmarks:
         bookmarks_html = "<p class='no-bookmarks'>No bookmarks in this book.</p>"
         
+    novel = store.get_novel(novel_id)
+    is_pdf = novel and novel.get("file_format") == "pdf"
+        
     theme = state.get("theme", "sepia")
     font = state.get("font", 22)
     active_sepia = "active" if theme == "sepia" else ""
     active_light = "active" if theme == "light" else ""
     active_dark = "active" if theme == "dark" else ""
     
-    return f"""
-    <div class="settings-popover theme-{theme}">
-      <!-- Screen 1: Main Settings -->
-      <div class="settings-main-screen">
+    font_group_html = ""
+    if is_pdf:
+        zoom = state.get("zoom", 100)
+        font_group_html = f"""
+        <div class="settings-group">
+          <h4>Zoom</h4>
+          <div class="settings-row font-adjust">
+            <button class="settings-action" data-click="nr-font-down">Zoom-</button>
+            <span class="font-display">{zoom}%</span>
+            <button class="settings-action" data-click="nr-font-up">Zoom+</button>
+          </div>
+        </div>
+        """
+    else:
+        font = state.get("font", 22)
+        font_group_html = f"""
         <div class="settings-group">
           <h4>Font Size</h4>
           <div class="settings-row font-adjust">
@@ -611,6 +637,13 @@ def _settings_panel(novel_id: int | None, state: dict) -> str:
             <button class="settings-action" data-click="nr-font-up">A+</button>
           </div>
         </div>
+        """
+    
+    return f"""
+    <div class="settings-popover theme-{theme}">
+      <!-- Screen 1: Main Settings -->
+      <div class="settings-main-screen">
+        {font_group_html}
         <div class="settings-group">
           <h4>Theme</h4>
           <div class="settings-row themes">
@@ -1391,5 +1424,51 @@ READER_CSS = CSS + """
   stroke: var(--reader-ink) !important;
   stroke-width: 2.2px !important;
   fill: none !important;
+}
+.pdf-page-container {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12) !important;
+  border: 1px solid var(--reader-line) !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  background: #ffffff !important;
+  zoom: var(--pdf-zoom, 1) !important;
+  transition: zoom 0.2s ease !important;
+}
+.pdf-page-img {
+  transition: filter 0.3s ease !important;
+}
+[data-theme="dark"] .pdf-page-img {
+  filter: invert(0.9) hue-rotate(180deg) contrast(0.95) !important;
+}
+[data-theme="sepia"] .pdf-page-img {
+  filter: sepia(0.55) contrast(0.95) brightness(0.98) !important;
+}
+.pdf-text-layer {
+  color: transparent !important;
+  font-family: system-ui, -apple-system, sans-serif !important;
+  white-space: pre-wrap !important;
+  line-height: 1.15 !important;
+  cursor: text !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+.pdf-text-layer::selection {
+  background: rgba(0, 120, 215, 0.33) !important;
+  color: transparent !important;
+}
+.pdf-text-layer::-moz-selection {
+  background: rgba(0, 120, 215, 0.33) !important;
+  color: transparent !important;
+}
+.pdf-page-error {
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  width: 100% !important;
+  padding: 40px !important;
+  background: rgba(235, 94, 85, 0.1) !important;
+  border: 1px dashed #eb5e55 !important;
+  border-radius: 8px !important;
+  color: #eb5e55 !important;
 }
 """
