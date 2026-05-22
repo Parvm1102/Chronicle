@@ -1,0 +1,10 @@
+.venv/
+venv/
+myenv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+data/reader.sqlite3
+data/novels/
+*.log
