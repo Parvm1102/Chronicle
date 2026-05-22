@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import posixpath
 import re
 from urllib.parse import quote_plus
 
@@ -46,7 +47,7 @@ def build_reader_app() -> gr.Blocks:
             with gr.Column(scale=1, min_width=230, elem_classes=["chapter-rail"]):
                 gr.HTML("<a class='rail-link' href='/dashboard/'>Dashboard</a>")
                 chapters = gr.Radio(label="Chapters", choices=[], interactive=True, elem_classes=["chapters"])
-            with gr.Column(scale=5, min_width=560):
+            with gr.Column(scale=5, min_width=560, elem_classes=["reader-body"]):
                 top = gr.HTML()
                 page = gr.HTML(_empty_page())
                 notes = gr.HTML()
@@ -486,10 +487,32 @@ def _render(state, message: str = "", save_progress: bool = False):
     return _page(section, count, state), _top(novel, section, state), _chapter_update(novel_id, state), _notes(novel_id, state["theme"]), _notice(message), state
 
 
+def _clean_chapter_title(title: str, index: int) -> str:
+    if not title:
+        return f"Chapter {index + 1}"
+    title = title.strip()
+    # Check if it looks like a filepath or ends with file extensions
+    if "/" in title or "\\" in title or title.lower().endswith((".html", ".xhtml", ".xml", ".htm")):
+        basename = posixpath.basename(title.replace("\\", "/"))
+        # split_003 -> Chapter 4
+        num_match = re.search(r"split_(\d+)", basename)
+        if num_match:
+            return f"Chapter {int(num_match.group(1)) + 1}"
+        # generic number search, e.g. chapter_04 -> Chapter 4
+        num_match_generic = re.search(r"(\d+)", basename)
+        if num_match_generic:
+            return f"Chapter {int(num_match_generic.group(1))}"
+        # stem title fallback
+        stem = posixpath.splitext(basename)[0]
+        stem = stem.replace("_", " ").replace("-", " ").title()
+        return stem or f"Chapter {index + 1}"
+    return title
+
+
 def _top(novel: dict, section: dict | None, state: dict) -> str:
     count = store.section_count(novel["id"]) if novel and novel["status"] == "complete" else 0
     progress = f"{section['section_index'] + 1}/{count}" if section else ""
-    title = section["title"] if section else novel["title"]
+    title = _clean_chapter_title(section["title"], section["section_index"]) if section else novel["title"]
     return f"""
     <header class="top theme-{state['theme']}">
       <div><small>{_escape(novel['title'])}</small><strong>{_escape(title)}</strong></div>
@@ -507,7 +530,7 @@ def _top(novel: dict, section: dict | None, state: dict) -> str:
 
 
 def _chapter_update(novel_id: int, state: dict):
-    choices = [(s["title"], s["section_index"]) for s in store.list_sections(novel_id)]
+    choices = [(_clean_chapter_title(s["title"], s["section_index"]), s["section_index"]) for s in store.list_sections(novel_id)]
     return gr.update(choices=choices, value=int(state["section"]))
 
 
@@ -634,6 +657,20 @@ function bootReader() {
     bar.style.left = `${Math.max(10, Math.min(innerWidth - 260, rect.left + rect.width / 2 - 120))}px`;
     bar.style.top = `${Math.max(10, scrollY + rect.top - 46)}px`;
     bar.classList.add("show");
+  });
+
+  // Force Svelte layout reflows so observers position dynamic chapters perfectly at 100% zoom
+  [50, 150, 300, 600, 1200, 2500, 4000].forEach(delay => {
+    setTimeout(() => {
+      window.dispatchEvent(new Event('resize'));
+      const rail = q('.chapter-rail');
+      if (rail) {
+        const d = rail.style.display;
+        rail.style.display = 'none';
+        rail.offsetHeight;
+        rail.style.display = d;
+      }
+    }, delay);
   });
 }
 bootReader();
@@ -874,19 +911,49 @@ html[data-theme=dark] .meta-row { border-bottom-color:rgba(255,255,255,0.05); }
 @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
 /* ── Reader layout ────────────────────────────────────────────────── */
-.reader-grid { min-height:100vh; gap:0!important; }
-.chapter-rail { background:var(--rail-bg)!important; color:var(--rail-fg)!important; padding:18px 0!important; border-right:1px solid var(--rail-border); }
+@media (min-width: 861px) {
+  .reader-grid { display:flex!important; flex-direction:row!important; align-items:stretch!important; min-height:100vh!important; gap:0!important; }
+  .chapter-rail { display:flex!important; flex-direction:column!important; flex-wrap:nowrap!important; position:sticky!important; top:0!important; height:100vh!important; overflow-y:auto!important; overflow-x:hidden!important; flex:0 0 280px!important; min-width:280px!important; max-width:280px!important; background:var(--rail-bg)!important; color:var(--rail-fg)!important; padding:18px 0!important; border-right:1px solid var(--rail-border)!important; box-sizing:border-box!important; z-index:100!important; }
+  .reader-body { flex:1!important; min-width:0!important; box-sizing:border-box!important; display:flex!important; flex-direction:column!important; }
+}
+
+@media (max-width: 860px) {
+  .reader-grid { min-height:100vh; gap:0!important; }
+  .chapter-rail { display:none!important; }
+}
+
+/* Force each chapter choice inside the radio group to render on a fresh single line spanning 100% width */
+.chapters .gr-radio-group {
+  display:flex!important;
+  flex-direction:column!important;
+  align-items:stretch!important;
+  width:100%!important;
+}
+
+.chapters label {
+  width:100%!important;
+  flex:1 1 100%!important;
+  display:flex!important;
+  align-items:center!important;
+  box-sizing:border-box!important;
+  margin:0!important;
+  padding:14px 18px!important;
+  border-top:1px solid var(--rail-border)!important;
+  border-radius:0!important;
+  color:var(--rail-fg)!important;
+  background:transparent!important;
+}
+.chapters label:has(input:checked) { color:var(--blue)!important; }
+
 /* Force ALL children of chapter-rail to use rail colors regardless of any other color overrides */
 .chapter-rail * { color:var(--rail-fg)!important; background:transparent!important; }
 .chapter-rail .block, .chapter-rail .wrap, .chapter-rail .panel, .chapter-rail fieldset, .chapter-rail .form { border:none!important; box-shadow:none!important; }
 .chapter-rail span.group-text { color:var(--rail-fg)!important; }
 .rail-link { display:block; margin:0 18px 18px; color:var(--rail-fg)!important; text-decoration:none; }
-.chapters label { margin:0!important; padding:14px 18px!important; border-top:1px solid var(--rail-border)!important; border-radius:0!important; color:var(--rail-fg)!important; background:transparent!important; }
-.chapters label:has(input:checked) { color:var(--blue)!important; }
 /* theme-* classes kept on elements for state tracking; all reader vars now flow from html[data-theme] */
 .top { height:64px; display:flex; align-items:center; justify-content:space-between; gap:18px; padding:0 28px; color:var(--reader-ink)!important; background:var(--reader-bg)!important; border-bottom:1px solid var(--reader-line); }
-.top small { display:block; color:var(--reader-muted); font-size:12px; }
-.top strong { display:block; font:400 20px/1.15 Georgia,serif; }
+.top small { display:block!important; color:var(--reader-muted)!important; font-size:12px!important; }
+.top strong { display:block!important; font:400 20px/1.15 Georgia,serif!important; color:var(--reader-ink)!important; }
 .top nav { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
 .top a, .top button { border:1px solid var(--reader-line)!important; background:transparent!important; border-radius:6px!important; color:var(--reader-ink)!important; box-shadow:none!important; text-decoration:none; padding:7px 10px; }
 .top span { min-width:54px; text-align:center; color:var(--reader-muted); font-size:13px; }

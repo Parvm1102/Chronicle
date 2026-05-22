@@ -144,6 +144,27 @@ def parse_txt(path: Path) -> ParsedBook:
     return ParsedBook(_clean_title(path.stem), "Unknown author", "txt", sections or [_empty_section()])
 
 
+def _build_toc_map(toc_items, toc_map=None) -> dict[str, str]:
+    if toc_map is None:
+        toc_map = {}
+    for item in toc_items:
+        if isinstance(item, (list, tuple)):
+            _build_toc_map(item, toc_map)
+        else:
+            href = getattr(item, "href", "")
+            title = getattr(item, "title", "")
+            if href and title:
+                path_only = href.split("#")[0]
+                path_only = path_only.replace("\\", "/")
+                # Store full paths and basenames
+                if path_only not in toc_map:
+                    toc_map[path_only] = title.strip()
+                base = posixpath.basename(path_only)
+                if base not in toc_map:
+                    toc_map[base] = title.strip()
+    return toc_map
+
+
 def parse_epub(path: Path) -> ParsedBook:
     from ebooklib import ITEM_DOCUMENT, ITEM_IMAGE
     from ebooklib import epub
@@ -152,27 +173,82 @@ def parse_epub(path: Path) -> ParsedBook:
     title = _metadata_value(book, "title") or _clean_title(path.stem)
     author = _metadata_value(book, "creator") or "Unknown author"
     images = _epub_images(book, ITEM_IMAGE)
-    sections: list[ParsedSection] = []
 
-    for item in _epub_documents(book, ITEM_DOCUMENT):
-        soup = BeautifulSoup(item.get_content(), "html.parser")
-        for tag in soup(["script", "style", "nav"]):
-            tag.decompose()
-        body = soup.body or soup
-        html = _clean_epub_html(body, item.get_name(), images)
-        title_tag = soup.find(["h1", "h2", "h3"])
-        section_title = title_tag.get_text(" ", strip=True) if title_tag else item.get_name()
-        text = _normalize_text(body.get_text("\n"))
-        if text or "<img" in html or "<hr" in html:
-            sections.append(
-                ParsedSection(
-                    index=len(sections),
-                    title=section_title or f"Chapter {len(sections) + 1}",
-                    text=text or section_title or "Illustration",
-                    source_locator=f"epub:{item.get_name()}",
-                    html=html,
+    toc_map = {}
+    if book.toc:
+        _build_toc_map(book.toc, toc_map)
+
+    # Let's perform a dual-pass load. Pass 1 attempts high-precision TOC-only document inclusion.
+    # If that yields 0 sections (or very few), Pass 2 loads all spine documents to avoid content loss.
+    sections: list[ParsedSection] = []
+    
+    for pass_num in (1, 2):
+        if sections:
+            break
+        use_toc_filtering = (pass_num == 1) and (len(toc_map) > 0)
+        
+        for item in _epub_documents(book, ITEM_DOCUMENT):
+            raw_name = item.get_name() or ""
+            clean_name = raw_name.replace("\\", "/")
+            base_name = posixpath.basename(clean_name)
+            
+            # Match against TOC
+            toc_title = ""
+            if clean_name in toc_map:
+                toc_title = toc_map[clean_name]
+            elif base_name in toc_map:
+                toc_title = toc_map[base_name]
+
+            # If TOC filtering is active and this spine document isn't in TOC, skip it
+            if use_toc_filtering and not toc_title:
+                continue
+
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            for tag in soup(["script", "style", "nav"]):
+                tag.decompose()
+            body = soup.body or soup
+            html = _clean_epub_html(body, item.get_name(), images)
+
+            # Determine title: Use TOC title first if found, otherwise extract/clean
+            if toc_title:
+                section_title = toc_title
+            else:
+                # Fallback to headers
+                title_tag = soup.find(["h1", "h2", "h3", "h4", "h5", "h6"])
+                section_title = title_tag.get_text(" ", strip=True) if title_tag else ""
+                if not section_title:
+                    head_title = soup.find("title")
+                    if head_title:
+                        section_title = head_title.get_text(" ", strip=True)
+
+                if not section_title or "/" in section_title or section_title.endswith((".html", ".xhtml", ".xml", ".htm")):
+                    basename = posixpath.basename((section_title or raw_name).replace("\\", "/"))
+                    num_match = re.search(r"split_(\d+)", basename)
+                    if num_match:
+                        section_title = f"Chapter {int(num_match.group(1)) + 1}"
+                    else:
+                        num_match_generic = re.search(r"(\d+)", basename)
+                        if num_match_generic:
+                            section_title = f"Chapter {int(num_match_generic.group(1))}"
+                        else:
+                            stem = posixpath.splitext(basename)[0]
+                            stem = stem.replace("_", " ").replace("-", " ").title()
+                            section_title = stem or f"Chapter {len(sections) + 1}"
+
+            if section_title.lower() == title.lower():
+                section_title = f"Chapter {len(sections) + 1}"
+
+            text = _normalize_text(body.get_text("\n"))
+            if text or "<img" in html or "<hr" in html:
+                sections.append(
+                    ParsedSection(
+                        index=len(sections),
+                        title=section_title.strip() or f"Chapter {len(sections) + 1}",
+                        text=text or section_title or "Illustration",
+                        source_locator=f"epub:{raw_name}",
+                        html=html,
+                    )
                 )
-            )
 
     if not sections:
         sections = [_empty_section()]
@@ -247,18 +323,70 @@ def parse_pdf(path: Path) -> ParsedBook:
 
     document = fitz.open(path)
     sections: list[ParsedSection] = []
-    for page_index in range(document.page_count):
-        page = document.load_page(page_index)
-        text = _normalize_text(page.get_text("text"))
-        if text:
-            sections.append(
-                ParsedSection(
-                    index=len(sections),
-                    title=f"Page {page_index + 1}",
-                    text=text,
-                    source_locator=f"pdf:page:{page_index + 1}",
+    
+    toc = []
+    try:
+        toc = document.get_toc()
+    except Exception:
+        pass
+        
+    page_count = document.page_count
+    
+    if toc:
+        bookmarks = []
+        for item in toc:
+            if len(item) >= 3 and isinstance(item[2], int) and 1 <= item[2] <= page_count:
+                bookmarks.append((item[1], item[2]))
+        bookmarks.sort(key=lambda x: x[1])
+        
+        # Preface / frontmatter pages before Chapter 1
+        if bookmarks and bookmarks[0][1] > 1:
+            pre_text = []
+            for p in range(0, bookmarks[0][1] - 1):
+                try:
+                    pre_text.append(document.load_page(p).get_text("text"))
+                except Exception:
+                    pass
+            full_pre = _normalize_text("\n".join(pre_text))
+            if full_pre:
+                sections.append(ParsedSection(0, "Opening", full_pre, "pdf:page:1"))
+                
+        # Group text by bookmark ranges
+        for i, (title, start_page) in enumerate(bookmarks):
+            end_page = bookmarks[i + 1][1] if i + 1 < len(bookmarks) else page_count + 1
+            chap_text = []
+            for p in range(start_page - 1, end_page - 1):
+                if p < page_count:
+                    try:
+                        chap_text.append(document.load_page(p).get_text("text"))
+                    except Exception:
+                        pass
+            full_text = _normalize_text("\n".join(chap_text))
+            if full_text:
+                sections.append(
+                    ParsedSection(
+                        index=len(sections),
+                        title=title.strip() or f"Section {len(sections) + 1}",
+                        text=full_text,
+                        source_locator=f"pdf:page:{start_page}",
+                    )
                 )
-            )
+    
+    # Fallback to page-by-page if no TOC bookmarks found
+    if not sections:
+        for page_index in range(page_count):
+            page = document.load_page(page_index)
+            text = _normalize_text(page.get_text("text"))
+            if text:
+                sections.append(
+                    ParsedSection(
+                        index=len(sections),
+                        title=f"Page {page_index + 1}",
+                        text=text,
+                        source_locator=f"pdf:page:{page_index + 1}",
+                    )
+                )
+                
     document.close()
     return ParsedBook(_clean_title(path.stem), "Unknown author", "pdf", sections or [_empty_section()])
 
