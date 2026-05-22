@@ -363,3 +363,25 @@ class LibraryStore:
                 "SELECT * FROM dictionary_lookups WHERE novel_id = ? ORDER BY created_at DESC LIMIT 20", (novel_id,)
             )]
             return bookmarks, highlights, lookups
+
+    def list_all_bookmarks(self, novel_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM bookmarks WHERE novel_id = ? ORDER BY section_index ASC, created_at ASC", (novel_id,)
+            )]
+
+    def get_section_bookmarks(self, novel_id: int | None, section_index: int) -> list[str]:
+        if not novel_id:
+            return []
+        with self.connect() as conn:
+            return [row["label"] for row in conn.execute(
+                "SELECT label FROM bookmarks WHERE novel_id = ? AND section_index = ?", (novel_id, section_index)
+            )]
+
+    def get_section_lookups(self, novel_id: int | None, section_index: int) -> list[str]:
+        if not novel_id:
+            return []
+        with self.connect() as conn:
+            return [row["query"] for row in conn.execute(
+                "SELECT query FROM dictionary_lookups WHERE novel_id = ? AND section_index = ?", (novel_id, section_index)
+            )]

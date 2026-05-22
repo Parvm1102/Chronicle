@@ -50,7 +50,7 @@ def build_reader_app() -> gr.Blocks:
             with gr.Column(scale=5, min_width=560, elem_classes=["reader-body"]):
                 top = gr.HTML()
                 page = gr.HTML(_empty_page())
-                notes = gr.HTML()
+                settings_panel = gr.HTML(elem_id="settings-popup-panel")
                 msg = gr.HTML()
                 with gr.Row(elem_classes=["hidden"]):
                     prev = gr.Button("prev", elem_id="nr-prev")
@@ -64,27 +64,28 @@ def build_reader_app() -> gr.Blocks:
                     dark = gr.Button("dark", elem_id="nr-dark")
                     speak = gr.Button("speak", elem_id="nr-speak")
                     selected = gr.Textbox(elem_id="nr-selected-text", container=False, show_label=False)
-                    mark = gr.Button("mark", elem_id="nr-mark")
+                    bookmark = gr.Button("bookmark", elem_id="nr-bookmark")
                     define = gr.Button("define", elem_id="nr-define")
-                    save = gr.Button("save", elem_id="nr-save")
                     speak_selected = gr.Button("speak selected", elem_id="nr-speak-selected")
+                    target_jump = gr.Textbox(elem_id="nr-target-jump", container=False, show_label=False)
+                    do_jump = gr.Button("jump", elem_id="nr-do-jump")
 
-        demo.load(_reader_load, outputs=[page, top, chapters, notes, msg, state])
-        chapters.change(_jump, [chapters, state], [page, top, chapters, notes, msg, state])
-        prev.click(_move, [state, gr.State(-1)], [page, top, chapters, notes, msg, state])
-        next_.click(_move, [state, gr.State(1)], [page, top, chapters, notes, msg, state])
-        back.click(_history, [state, gr.State("back")], [page, top, chapters, notes, msg, state])
-        forward.click(_history, [state, gr.State("forward")], [page, top, chapters, notes, msg, state])
-        font_up.click(_font, [state, gr.State(1)], [page, top, chapters, notes, msg, state])
-        font_down.click(_font, [state, gr.State(-1)], [page, top, chapters, notes, msg, state])
-        sepia.click(_theme, [state, gr.State("sepia")], [page, top, chapters, notes, msg, state])
-        light.click(_theme, [state, gr.State("light")], [page, top, chapters, notes, msg, state])
-        dark.click(_theme, [state, gr.State("dark")], [page, top, chapters, notes, msg, state])
+        demo.load(_reader_load, outputs=[page, top, chapters, settings_panel, msg, state])
+        chapters.change(_jump, [chapters, state], [page, top, chapters, settings_panel, msg, state])
+        prev.click(_move, [state, gr.State(-1)], [page, top, chapters, settings_panel, msg, state])
+        next_.click(_move, [state, gr.State(1)], [page, top, chapters, settings_panel, msg, state])
+        back.click(_history, [state, gr.State("back")], [page, top, chapters, settings_panel, msg, state])
+        forward.click(_history, [state, gr.State("forward")], [page, top, chapters, settings_panel, msg, state])
+        font_up.click(_font, [state, gr.State(1)], [page, top, chapters, settings_panel, msg, state])
+        font_down.click(_font, [state, gr.State(-1)], [page, top, chapters, settings_panel, msg, state])
+        sepia.click(_theme, [state, gr.State("sepia")], [page, top, chapters, settings_panel, msg, state])
+        light.click(_theme, [state, gr.State("light")], [page, top, chapters, settings_panel, msg, state])
+        dark.click(_theme, [state, gr.State("dark")], [page, top, chapters, settings_panel, msg, state])
         speak.click(_speak, [state, gr.State("")], msg)
         speak_selected.click(_speak, [state, selected], msg)
-        mark.click(_mark, [state, selected], [notes, msg])
-        define.click(_define, [state, selected], [notes, msg])
-        save.click(_save, [state, selected], [notes, msg])
+        bookmark.click(_bookmark, [state, selected], [page, top, chapters, settings_panel, msg, state])
+        define.click(_define, [state, selected], [page, top, chapters, settings_panel, msg, state])
+        do_jump.click(_jump, [target_jump, state], [page, top, chapters, settings_panel, msg, state])
     return demo
 
 
@@ -436,13 +437,13 @@ def _theme(state, theme):
     return _render({**state, "theme": theme})
 
 
-def _mark(state, text):
+def _bookmark(state, text):
     text = (text or "").strip()
     novel_id = state.get("novel_id")
     if novel_id and text:
-        store.add_highlight(novel_id, int(state["section"]), text)
-        return _notes(novel_id, state["theme"]), _notice("Highlighted.")
-    return _notes(novel_id, state["theme"]), _notice("Select text first.", "warn")
+        store.add_bookmark(novel_id, int(state["section"]), text)
+        return _render(state, "Bookmarked.")
+    return _render(state, "Select text first.")
 
 
 def _define(state, text):
@@ -450,18 +451,8 @@ def _define(state, text):
     novel_id = state.get("novel_id")
     if novel_id and text:
         store.add_dictionary_lookup(novel_id, int(state["section"]), text, _meaning_url(text))
-        return _notes(novel_id, state["theme"]), _notice("Definition saved.")
-    return _notes(novel_id, state["theme"]), _notice("Select text first.", "warn")
-
-
-def _save(state, text):
-    novel_id = state.get("novel_id")
-    if not novel_id:
-        return "", _notice("Open a book first.", "warn")
-    section = store.get_section(novel_id, int(state["section"]))
-    label = (text or "").strip()[:80] or (section["title"] if section else "Saved position")
-    store.add_bookmark(novel_id, int(state["section"]), label)
-    return _notes(novel_id, state["theme"]), _notice("Bookmark saved.")
+        return _render(state, f"Defined: {text}")
+    return _render(state, "Select word first.")
 
 
 def _speak(state, text):
@@ -477,14 +468,14 @@ def _render(state, message: str = "", save_progress: bool = False):
     if not novel:
         return _empty_page(), "", gr.update(choices=[]), "", _notice("Book not found.", "warn"), state
     if novel["status"] != "complete":
-        return _waiting_page(novel, state), _top(novel, None, state), _chapter_update(novel_id, state), _notes(novel_id, state["theme"]), _notice(novel["status_message"]), state
+        return _waiting_page(novel, state), _top(novel, None, state), _chapter_update(novel_id, state), _settings_panel(novel_id, state), _notice(novel["status_message"]), state
 
     count = store.section_count(novel_id)
     state = {**state, "section": max(0, min(count - 1, int(state["section"])))}
     if save_progress:
         store.update_progress(novel_id, int(state["section"]))
     section = store.get_section(novel_id, int(state["section"]))
-    return _page(section, count, state), _top(novel, section, state), _chapter_update(novel_id, state), _notes(novel_id, state["theme"]), _notice(message), state
+    return _page(section, count, state), _top(novel, section, state), _chapter_update(novel_id, state), _settings_panel(novel_id, state), _notice(message), state
 
 
 def _clean_chapter_title(title: str, index: int) -> str:
@@ -521,9 +512,12 @@ def _top(novel: dict, section: dict | None, state: dict) -> str:
         <button data-click="nr-back">Back</button><button data-click="nr-prev">Prev</button>
         <span>{_escape(progress)}</span>
         <button data-click="nr-next">Next</button><button data-click="nr-forward">Forward</button>
-        <button data-click="nr-font-down">A-</button><button data-click="nr-font-up">A+</button>
-        <button data-click="nr-sepia">Sepia</button><button data-click="nr-light">Light</button><button data-click="nr-dark">Dark</button>
-        <button data-click="nr-speak">Speak</button>
+        <button class="settings-trigger" title="Settings">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
       </nav>
     </header>
     """
@@ -534,11 +528,36 @@ def _chapter_update(novel_id: int, state: dict):
     return gr.update(choices=choices, value=int(state["section"]))
 
 
+def _highlight_phrases(html: str, phrases: list[str], css_class: str) -> str:
+    if not phrases:
+        return html
+    phrases = sorted(list(set(phrases)), key=len, reverse=True)
+    parts = re.split(r'(<[^>]+>)', html)
+    for i in range(len(parts)):
+        if parts[i].startswith('<') and parts[i].endswith('>'):
+            continue
+        for phrase in phrases:
+            if not phrase.strip():
+                continue
+            escaped = re.escape(phrase)
+            replacement = f'<span class="{css_class}" data-phrase="{_escape(phrase)}">{phrase}</span>'
+            parts[i] = re.sub(escaped, replacement, parts[i])
+    return "".join(parts)
+
+
 def _page(section: dict | None, count: int, state: dict) -> str:
     if not section:
         return _empty_page()
     progress = int(((section["section_index"] + 1) / max(count, 1)) * 100)
     content = section["html"] or _paragraphs(section["text"])
+    
+    novel_id = state.get("novel_id")
+    if novel_id:
+        bookmarks = store.get_section_bookmarks(novel_id, section["section_index"])
+        lookups = store.get_section_lookups(novel_id, section["section_index"])
+        content = _highlight_phrases(content, bookmarks, "bookmark-dotted")
+        content = _highlight_phrases(content, lookups, "define-dotted")
+
     return f"""
     <article class="page theme-{state['theme']}" style="--font:{state['font']}px">
       <div class="progress"><span style="width:{progress}%"></span></div>
@@ -555,12 +574,70 @@ def _empty_page() -> str:
     return "<article class='page theme-sepia'><div class='empty'><h2>Open a book from your dashboard.</h2></div></article>"
 
 
-def _notes(novel_id: int | None, theme: str) -> str:
-    bookmarks, highlights, lookups = store.sidebar_items(novel_id)
+def _settings_panel(novel_id: int | None, state: dict) -> str:
+    if not novel_id:
+        return ""
+    bookmarks = store.list_all_bookmarks(novel_id)
+    bookmarks_html = ""
+    for b in bookmarks:
+        section_title = f"Ch {b['section_index'] + 1}"
+        preview = _escape(b['label'][:45])
+        if len(b['label']) > 45:
+            preview += "..."
+        bookmarks_html += f"""
+        <div class="bookmark-item" data-goto-section="{b['section_index']}" data-goto-text="{_escape(b['label'])}">
+          <span class="b-sec">{section_title}</span>
+          <span class="b-text">"{preview}"</span>
+        </div>
+        """
+    if not bookmarks:
+        bookmarks_html = "<p class='no-bookmarks'>No bookmarks in this book.</p>"
+        
+    theme = state.get("theme", "sepia")
+    font = state.get("font", 22)
+    active_sepia = "active" if theme == "sepia" else ""
+    active_light = "active" if theme == "light" else ""
+    active_dark = "active" if theme == "dark" else ""
+    
     return f"""
-    <details class="notes theme-{theme}"><summary>Saved</summary>
-      <section>{_note('Bookmarks', bookmarks, 'label')}{_note('Highlights', highlights, 'quote')}{_note('Dictionary', lookups, 'query')}</section>
-    </details>
+    <div class="settings-popover theme-{theme}">
+      <!-- Screen 1: Main Settings -->
+      <div class="settings-main-screen">
+        <div class="settings-group">
+          <h4>Font Size</h4>
+          <div class="settings-row font-adjust">
+            <button class="settings-action" data-click="nr-font-down">A-</button>
+            <span class="font-display">{font}px</span>
+            <button class="settings-action" data-click="nr-font-up">A+</button>
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4>Theme</h4>
+          <div class="settings-row themes">
+            <button class="theme-btn sepia {active_sepia}" data-theme-set="sepia">Sepia</button>
+            <button class="theme-btn light {active_light}" data-theme-set="light">Light</button>
+            <button class="theme-btn dark {active_dark}" data-theme-set="dark">Dark</button>
+          </div>
+        </div>
+        <div class="settings-group" style="border-bottom: none; padding-bottom: 0; margin-bottom: 0;">
+          <button class="theme-btn view-bookmarks-btn" style="display: flex; justify-content: space-between; align-items: center; width: 100% !important; background: var(--blue) !important; color: #ffffff !important; border-color: var(--blue) !important;">
+            <span>View Bookmarks ({len(bookmarks)})</span>
+            <span style="font-weight: bold; margin-left: 8px;">&rarr;</span>
+          </button>
+        </div>
+      </div>
+      
+      <!-- Screen 2: Bookmarks Screen -->
+      <div class="settings-bookmarks-screen" style="display: none;">
+        <div class="settings-group" style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px; border-bottom: 1px dashed var(--line); padding-bottom: 8px;">
+          <button class="back-to-settings-btn" style="background: transparent; border: none; color: var(--blue); cursor: pointer; font-size: 16px; padding: 0 4px 0 0; font-weight: bold; display: inline-flex; align-items: center;">&larr;</button>
+          <h4 style="margin: 0 !important; color: var(--muted) !important; font-size: 11px !important; text-transform: uppercase !important; letter-spacing: 0.5px !important;">Bookmarks ({len(bookmarks)})</h4>
+        </div>
+        <div class="bookmarks-list">
+          {bookmarks_html}
+        </div>
+      </div>
+    </div>
     """
 
 
@@ -609,7 +686,18 @@ const setBox = (id, value) => {
   const field = q(`#${id} textarea, #${id} input`);
   if (field) { field.value = value; field.dispatchEvent(new Event("input", { bubbles: true })); }
 };
-const click = (id) => q(`#${id} button`)?.click();
+
+// Fixed Gradio 4 element-level click interceptor mapping
+const click = (id) => {
+  const el = q(`#${id}`);
+  if (!el) return;
+  if (el.tagName === "BUTTON") {
+    el.click();
+  } else {
+    el.querySelector("button")?.click();
+  }
+};
+
 const selectionText = () => {
   const sel = getSelection();
   const text = sel && !sel.isCollapsed ? sel.toString().trim().replace(/\s+/g, " ") : "";
@@ -625,15 +713,133 @@ function applyTheme(name) {
   document.documentElement.setAttribute('data-theme', name);
 }
 
+function checkAndScrollBookmark() {
+  if (!window.__gotoBookmarkText) return;
+  const phrase = window.__gotoBookmarkText;
+  const el = Array.from(document.querySelectorAll(".bookmark-dotted")).find(
+    span => span.dataset.phrase === phrase || span.textContent.trim() === phrase
+  );
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.style.backgroundColor = 'rgba(255, 215, 0, 0.4)';
+    setTimeout(() => { el.style.backgroundColor = 'transparent'; }, 2000);
+    window.__gotoBookmarkText = null;
+  }
+}
+
+// Seamlessly preserve settings popup state across Svelte server re-renders
+function syncSettingsPopupState() {
+  const panel = q(".settings-popover");
+  if (!panel) return;
+  if (window.__settingsPanelOpen) {
+    if (!panel.classList.contains("show")) {
+      panel.classList.add("show");
+      const trigger = q(".settings-trigger");
+      if (trigger) {
+        const rect = trigger.getBoundingClientRect();
+        panel.style.top = `${rect.bottom + 8}px`; // Fixed position
+        panel.style.left = `${Math.max(10, Math.min(innerWidth - 320, rect.left + rect.width - 290))}px`;
+      }
+    }
+
+    // Toggle main settings screen vs bookmarks list sub-screen
+    const mainScreen = q(".settings-main-screen", panel);
+    const bScreen = q(".settings-bookmarks-screen", panel);
+    if (mainScreen && bScreen) {
+      if (window.__settingsPanelBookmarksScreen) {
+        mainScreen.style.display = "none";
+        bScreen.style.display = "block";
+      } else {
+        mainScreen.style.display = "block";
+        bScreen.style.display = "none";
+      }
+    }
+  } else {
+    panel.classList.remove("show");
+  }
+}
+
 function bootReader() {
   if (window.__readerBooted) return;
   window.__readerBooted = true;
+  
   const bar = document.createElement("div");
   bar.id = "select-bar";
-  bar.innerHTML = "<button data-a='mark'>Mark</button><button data-a='define'>Define</button><button data-a='save'>Save</button><button data-a='speak-selected'>Speak</button>";
   document.body.appendChild(bar);
 
+  // Prevent selection clearing when clicking buttons in selection bar
+  bar.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+  });
+
+  // Set up instant MutationObserver on settings popup container to prevent any flicker during Svelte DOM updates
+  const observer = new MutationObserver(() => {
+    syncSettingsPopupState();
+  });
+  const container = q("#settings-popup-panel") || document.body;
+  observer.observe(container, { childList: true, subtree: true });
+
+  // Poll for bookmark targets and keep settings open state synchronized
+  setInterval(checkAndScrollBookmark, 300);
+  setInterval(syncSettingsPopupState, 50);
+
   document.addEventListener("click", (event) => {
+    // Intercept bookmarks clicks inside the settings popup
+    const bookmarkItem = event.target.closest(".bookmark-item");
+    if (bookmarkItem) {
+      const section = bookmarkItem.dataset.gotoSection;
+      const text = bookmarkItem.dataset.gotoText;
+      window.__gotoBookmarkText = text;
+      setBox("nr-target-jump", section);
+      click("nr-do-jump");
+      return;
+    }
+
+    // Toggle settings popup visibility & positioning
+    const trigger = event.target.closest(".settings-trigger");
+    const panel = q(".settings-popover");
+    if (trigger) {
+      event.preventDefault();
+      if (panel) {
+        panel.classList.toggle("show");
+        window.__settingsPanelOpen = panel.classList.contains("show");
+        if (window.__settingsPanelOpen) {
+          const rect = trigger.getBoundingClientRect();
+          panel.style.top = `${rect.bottom + 8}px`; // Fixed position
+          panel.style.left = `${Math.max(10, Math.min(innerWidth - 320, rect.left + rect.width - 290))}px`;
+        }
+      }
+      return;
+    }
+
+    // Sub-screen transition triggers inside settings panel
+    if (event.target.closest(".view-bookmarks-btn")) {
+      event.preventDefault();
+      window.__settingsPanelBookmarksScreen = true;
+      syncSettingsPopupState();
+      return;
+    }
+    if (event.target.closest(".back-to-settings-btn")) {
+      event.preventDefault();
+      window.__settingsPanelBookmarksScreen = false;
+      syncSettingsPopupState();
+      return;
+    }
+
+    // Double-guard settings open state when clicking elements inside settings popover
+    if (event.target.closest(".settings-popover")) {
+      window.__settingsPanelOpen = true;
+    }
+    
+    // Clicking outside closes the settings popup
+    if (panel && !event.target.closest(".settings-popover") && !event.target.closest(".settings-trigger")) {
+      // ONLY close if the click target is still in the document body (prevents closing on detached Svelte re-renders)
+      if (document.body.contains(event.target)) {
+        panel.classList.remove("show");
+        window.__settingsPanelOpen = false;
+      }
+    }
+
     const proxy = event.target.closest("[data-click]");
     if (proxy) {
       const themeKey = THEMES[proxy.dataset.click];
@@ -641,18 +847,46 @@ function bootReader() {
       click(proxy.dataset.click);
       return;
     }
+
+    const themeSet = event.target.closest("[data-theme-set]");
+    if (themeSet) {
+      const theme = themeSet.dataset.themeSet;
+      applyTheme(theme);
+      click(`nr-${theme}`);
+      return;
+    }
+
     const action = event.target.closest("#select-bar button");
-    if (!action) return;
-    const text = selectionText();
-    setBox("nr-selected-text", text);
-    if (action.dataset.a === "define" && text) window.open(`https://www.google.com/search?q=${encodeURIComponent(text + " meaning")}`, "_blank", "noopener");
-    click(`nr-${action.dataset.a}`);
-    bar.classList.remove("show");
+    if (action) {
+      const text = selectionText();
+      setBox("nr-selected-text", text);
+      if (action.dataset.a === "define" && text) {
+        window.open(`https://www.google.com/search?q=${encodeURIComponent(text + " meaning")}`, "_blank", "noopener");
+        click("nr-define");
+      } else if (action.dataset.a === "bookmark" && text) {
+        click("nr-bookmark");
+      } else if (action.dataset.a === "speak-selected" && text) {
+        click("nr-speak-selected");
+      }
+      bar.classList.remove("show");
+      return;
+    }
   });
 
-  document.addEventListener("mouseup", () => {
+  document.addEventListener("mouseup", (e) => {
+    if (e.target.closest("#select-bar")) return; // ignore mouseup when interacting with the select bar itself!
     const text = selectionText();
     if (!text) return bar.classList.remove("show");
+
+    // Dynamic selection popover button filters
+    const hasSpace = /\s/.test(text);
+    let buttonsHtml = `<button data-a='bookmark'>Bookmark</button>`;
+    if (!hasSpace && text.length > 0) {
+      buttonsHtml += `<button data-a='define'>Define</button>`;
+    }
+    buttonsHtml += `<button data-a='speak-selected'>Speak</button>`;
+    bar.innerHTML = buttonsHtml;
+
     const rect = getSelection().getRangeAt(0).getBoundingClientRect();
     bar.style.left = `${Math.max(10, Math.min(innerWidth - 260, rect.left + rect.width / 2 - 120))}px`;
     bar.style.top = `${Math.max(10, scrollY + rect.top - 46)}px`;
@@ -986,4 +1220,176 @@ READER_CSS = CSS + """
 #select-bar.show { display:flex; }
 #select-bar button { border:0; border-radius:5px; background:transparent; color:var(--reader-ink); padding:7px 10px; cursor:pointer; font-size:13px; }
 #select-bar button:hover { background:var(--reader-line); }
+
+/* Settings Popover Dropdown */
+.settings-popover {
+  position: fixed !important;
+  z-index: 1000;
+  display: none;
+  width: 300px;
+  background: var(--paper) !important;
+  color: var(--ink) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.18) !important;
+  padding: 20px !important;
+  box-sizing: border-box !important;
+  animation: slideUp 0.2s ease-out;
+}
+.settings-popover.show {
+  display: block !important;
+}
+.settings-group {
+  margin-bottom: 16px;
+  border-bottom: 1px dashed var(--line);
+  padding-bottom: 12px;
+}
+.settings-group:last-child {
+  margin-bottom: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.settings-group h4 {
+  margin: 0 0 10px 0 !important;
+  color: var(--muted) !important;
+  font-size: 11px !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.5px !important;
+}
+.settings-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.settings-row.themes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.font-adjust {
+  justify-content: space-between;
+}
+.font-display {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.settings-action, .theme-btn {
+  background: var(--bg) !important;
+  color: var(--ink) !important;
+  border: 1.5px solid var(--line) !important;
+  border-radius: 8px !important;
+  padding: 8px 12px !important;
+  cursor: pointer !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition: all 0.15s ease !important;
+  text-align: center !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+.settings-action:hover, .theme-btn:hover {
+  border-color: var(--ink) !important;
+  transform: translateY(-1px);
+}
+.theme-btn.active {
+  background: var(--blue) !important;
+  color: #ffffff !important;
+  border-color: var(--blue) !important;
+}
+/* Bookmarks list section inside popup */
+.bookmarks-list {
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 4px;
+}
+.bookmarks-list::-webkit-scrollbar {
+  width: 4px;
+}
+.bookmarks-list::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 2px;
+}
+.bookmark-item {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1.5px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.bookmark-item:hover {
+  border-color: var(--blue);
+  background: var(--paper);
+  transform: translateX(2px);
+}
+.bookmark-item .b-sec {
+  font-size: 10px;
+  font-weight: bold;
+  color: var(--blue);
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.bookmark-item .b-text {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.no-bookmarks {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+  margin: 12px 0 0 0;
+}
+
+/* Persistent dotted annotation underlines */
+.bookmark-dotted {
+  border-bottom: 2.2px dotted var(--blue) !important;
+  background: transparent !important;
+  cursor: pointer !important;
+  transition: background-color 0.3s ease;
+}
+.bookmark-dotted:hover {
+  background: rgba(47, 128, 237, 0.12) !important;
+}
+.define-dotted {
+  border-bottom: 2.2px dotted #9b51e0 !important; /* purple dotted */
+  background: transparent !important;
+  cursor: pointer !important;
+  transition: background-color 0.3s ease;
+}
+.define-dotted:hover {
+  background: rgba(155, 81, 224, 0.12) !important;
+}
+.settings-trigger {
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 50% !important;
+  padding: 0 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  border: 1.5px solid var(--reader-line) !important;
+  background: transparent !important;
+}
+.settings-trigger svg {
+  display: block;
+  stroke: var(--reader-ink) !important;
+  color: var(--reader-ink) !important;
+}
+.settings-trigger svg path,
+.settings-trigger svg circle {
+  stroke: var(--reader-ink) !important;
+  stroke-width: 2.2px !important;
+  fill: none !important;
+}
 """
