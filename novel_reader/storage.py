@@ -117,6 +117,8 @@ class LibraryStore:
                 conn.execute("ALTER TABLE novels ADD COLUMN genres TEXT NOT NULL DEFAULT ''")
             if "file_size" not in novel_columns:
                 conn.execute("ALTER TABLE novels ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0")
+            if "starred" not in novel_columns:
+                conn.execute("ALTER TABLE novels ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
 
     def create_novel_record(self, source_path: Path) -> int:
         book_uuid = uuid.uuid4().hex
@@ -194,7 +196,8 @@ class LibraryStore:
             rows = conn.execute(
                 f"""
                 SELECT n.*, COALESCE(p.section_index, 0) AS progress_section,
-                       (SELECT COUNT(*) FROM sections s WHERE s.novel_id = n.id) AS section_count
+                       (SELECT COUNT(*) FROM sections s WHERE s.novel_id = n.id) AS section_count,
+                       (SELECT s.text FROM sections s WHERE s.novel_id = n.id ORDER BY s.section_index LIMIT 1) AS first_section_text
                 FROM novels n
                 LEFT JOIN progress p ON p.novel_id = n.id
                 {where}
@@ -207,7 +210,9 @@ class LibraryStore:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT n.*, COALESCE(p.section_index, 0) AS progress_section
+                SELECT n.*, COALESCE(p.section_index, 0) AS progress_section,
+                       (SELECT COUNT(*) FROM sections s WHERE s.novel_id = n.id) AS section_count,
+                       (SELECT s.text FROM sections s WHERE s.novel_id = n.id ORDER BY s.section_index LIMIT 1) AS first_section_text
                 FROM novels n
                 LEFT JOIN progress p ON p.novel_id = n.id
                 WHERE n.id = ?
@@ -215,6 +220,7 @@ class LibraryStore:
                 (novel_id,),
             ).fetchone()
             return dict(row) if row else None
+
 
     def get_section(self, novel_id: int, section_index: int) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -275,6 +281,26 @@ class LibraryStore:
                 "UPDATE novels SET archived = 1, completed_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, novel_id),
             )
+
+    def toggle_starred(self, novel_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE novels SET starred = 1 - starred, updated_at = ? WHERE id = ?",
+                (utc_now(), novel_id),
+            )
+
+    def toggle_archived(self, novel_id: int) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute("SELECT archived FROM novels WHERE id = ?", (novel_id,)).fetchone()
+            if row:
+                new_val = 1 - row["archived"]
+                completed_at = now if new_val == 1 else None
+                conn.execute(
+                    "UPDATE novels SET archived = ?, completed_at = ?, updated_at = ? WHERE id = ?",
+                    (new_val, completed_at, now, novel_id),
+                )
+
 
     def delete_novel(self, novel_id: int) -> None:
         novel = self.get_novel(novel_id)

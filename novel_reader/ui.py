@@ -18,18 +18,24 @@ def build_dashboard_app() -> gr.Blocks:
         selected_id = gr.State(None)
         library = gr.HTML()
         detail = gr.HTML()
-        with gr.Row(visible=False) as actions:
-            archive = gr.Button("Completed reading")
-            delete = gr.Button("Delete")
+        with gr.Row(elem_classes=["hidden"]):
+            select = gr.Button("Select", elem_id="action-select-novel")
+            clear = gr.Button("Clear", elem_id="action-clear-select")
+            star = gr.Button("Star", elem_id="action-star")
+            archive = gr.Button("Archive", elem_id="action-archive")
+            delete = gr.Button("Delete", elem_id="action-delete")
         upload = gr.File(label="Add TXT, EPUB, or PDF", file_types=[".txt", ".epub", ".pdf"])
         refresh = gr.Button("Refresh")
         msg = gr.HTML()
 
-        demo.load(_dashboard_load, outputs=[library, detail, selected_id, actions, msg])
-        refresh.click(_dashboard_refresh, outputs=[library, detail, selected_id, actions, msg])
-        upload.upload(_upload, upload, [library, detail, selected_id, actions, msg])
-        archive.click(_archive, selected_id, [library, detail, selected_id, actions, msg])
-        delete.click(_delete, selected_id, [library, detail, selected_id, actions, msg])
+        demo.load(_dashboard_load, outputs=[library, detail, selected_id, msg])
+        refresh.click(_dashboard_refresh, outputs=[library, detail, selected_id, msg])
+        upload.upload(_upload, upload, [library, detail, selected_id, msg])
+        select.click(_dashboard_select, outputs=[library, detail, selected_id, msg])
+        clear.click(_dashboard_clear, outputs=[library, detail, selected_id, msg])
+        star.click(_toggle_star, selected_id, [library, detail, selected_id, msg])
+        archive.click(_toggle_archive, selected_id, [library, detail, selected_id, msg])
+        delete.click(_delete, selected_id, [library, detail, selected_id, msg])
     return demo
 
 
@@ -100,11 +106,19 @@ def _upload(file):
         return _dashboard_outputs(None, f"Upload failed: {exc}", "warn")
 
 
-def _archive(novel_id):
+def _toggle_star(novel_id):
     novel_id = _int(novel_id)
     if novel_id:
-        store.archive_novel(novel_id)
-        return _dashboard_outputs(None, "Moved to archive.")
+        store.toggle_starred(novel_id)
+        return _dashboard_outputs(novel_id, "Star status updated.")
+    return _dashboard_outputs(None, "Choose a book first.", "warn")
+
+
+def _toggle_archive(novel_id):
+    novel_id = _int(novel_id)
+    if novel_id:
+        store.toggle_archived(novel_id)
+        return _dashboard_outputs(novel_id, "Read status updated.")
     return _dashboard_outputs(None, "Choose a book first.", "warn")
 
 
@@ -116,13 +130,22 @@ def _delete(novel_id):
     return _dashboard_outputs(None, "Choose a book first.", "warn")
 
 
+def _dashboard_select(request: gr.Request):
+    novel_id = _request_id(request)
+    return _dashboard_outputs(novel_id)
+
+
+def _dashboard_clear():
+    return _dashboard_outputs(None)
+
+
+
 def _dashboard_outputs(novel_id: int | None, message: str = "", tone: str = "ok"):
     novel = store.get_novel(novel_id) if novel_id else None
     return (
         _dashboard(novel_id),
         _detail(novel),
         novel["id"] if novel else None,
-        gr.update(visible=bool(novel)),
         _notice(message, tone),
     )
 
@@ -152,52 +175,209 @@ def _dashboard(selected_id: int | None = None) -> str:
     """
 
 
+def _get_cover_html(novel: dict) -> str:
+    cover_image = novel.get("cover_image")
+    if cover_image:
+        return f'<img class="book-cover-img" src="{cover_image}" alt="Cover" />'
+        
+    # Beautiful text fallback cover
+    first_text = novel.get("first_section_text") or ""
+    # Strip HTML tags just in case
+    first_text = re.sub(r'<[^>]*>', '', first_text)
+    preview = first_text.strip()[:140]
+    if len(first_text) > 140:
+        preview += "..."
+    if not preview:
+        preview = "No text content available."
+        
+    return f"""
+    <div class="book-cover-fallback">
+      <div class="fallback-header">{_escape(novel['file_format'].upper())}</div>
+      <div class="fallback-title">{_escape(novel['title'])}</div>
+      <div class="fallback-divider"></div>
+      <div class="fallback-body">{_escape(preview)}</div>
+      <div class="fallback-footer">{_escape(novel['author'])}</div>
+    </div>
+    """
+
+
 def _card(novel: dict, selected_id: int | None) -> str:
     count = int(novel.get("section_count") or 0)
     done = int(novel.get("progress_section") or 0)
     progress = int(((done + 1) / count) * 100) if count else 0
     selected = " selected" if novel["id"] == selected_id else ""
+    
+    cover_html = _get_cover_html(novel)
+    
+    star_badge = ""
+    if novel.get("starred"):
+        star_badge = '<div class="star-badge" title="Starred">★</div>'
+        
     return f"""
     <a class="book-card{selected}" href="/dashboard?novel_id={novel['id']}">
-      <span>{_escape(novel['status'])}</span>
-      <strong>{_escape(novel['title'])}</strong>
-      <small>{_escape(novel['author'])}</small>
-      <em>{_escape(novel['original_filename'])}</em>
-      <i><b style="width:{progress}%"></b></i>
+      <div class="card-cover-container">
+        {cover_html}
+        {star_badge}
+      </div>
+      <div class="card-info">
+        <span class="card-format">{_escape(novel['file_format'].upper())}</span>
+        <strong class="card-title">{_escape(novel['title'])}</strong>
+        <small class="card-author">{_escape(novel['author'])}</small>
+        <div class="card-progress"><b style="width:{progress}%"></b></div>
+        <span class="card-progress-text">{progress}% read</span>
+      </div>
     </a>
     """
 
 
 def _detail(novel: dict | None) -> str:
     if not novel:
-        return "<aside class='detail empty'>Select a novel to see details.</aside>"
+        return ""
+        
+    novel_id = novel["id"]
+    starred = bool(novel.get("starred"))
+    archived = bool(novel.get("archived"))
+    
+    # SVG icons for logo buttons
+    star_icon = """<svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>"""
+    if starred:
+        star_icon = """<svg class="icon-svg filled" viewBox="0 0 24 24" fill="currentColor"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>"""
+        
+    archive_icon = """<svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>"""
+    if archived:
+        archive_icon = """<svg class="icon-svg filled" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>"""
+        
+    delete_icon = """<svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>"""
+    
+    continue_icon = """<svg class="icon-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>"""
+    
+    meta_items = []
+    
+    author = novel.get("author")
+    if author and author != "Unknown author":
+        meta_items.append(f"""
+        <div class="meta-row">
+          <span class="meta-label">Author</span>
+          <span class="meta-value">{_escape(author)}</span>
+        </div>
+        """)
+        
+    series = novel.get("series")
+    if series:
+        meta_items.append(f"""
+        <div class="meta-row">
+          <span class="meta-label">Series</span>
+          <span class="meta-value">{_escape(series)}</span>
+        </div>
+        """)
+        
+    genres = novel.get("genres")
+    if genres:
+        meta_items.append(f"""
+        <div class="meta-row">
+          <span class="meta-label">Genres</span>
+          <span class="meta-value">{_escape(genres)}</span>
+        </div>
+        """)
+        
     count = int(novel.get("section_count") or 0)
     done = int(novel.get("progress_section") or 0)
     percent = int(((done + 1) / count) * 100) if count else 0
-    summary = _summary(novel["id"]) if novel["status"] == "complete" else novel["status_message"]
-    read_label = "Read again" if novel.get("archived") else "Continue reading"
+    meta_items.append(f"""
+    <div class="meta-row">
+      <span class="meta-label">Progress</span>
+      <span class="meta-value">{percent}% ({done + 1} / {count} sections)</span>
+    </div>
+    """)
+    
+    meta_items.append(f"""
+    <div class="meta-row">
+      <span class="meta-label">Last Read</span>
+      <span class="meta-value">{_format_date(novel.get("updated_at"))}</span>
+    </div>
+    """)
+    
+    file_size = novel.get("file_size") or 0
+    if file_size:
+        meta_items.append(f"""
+        <div class="meta-row">
+          <span class="meta-label">Size</span>
+          <span class="meta-value">{_format_size(file_size)}</span>
+        </div>
+        """)
+        
+    metadata_html = "".join(meta_items)
+    cover_html = _get_cover_html(novel)
+    
+    starred_class = "active" if starred else ""
+    archived_class = "active" if archived else ""
+    read_label = "Read Again" if archived else "Continue Reading"
+    
     return f"""
-    <aside class="detail">
-      <p>{_escape(novel['file_format'].upper())}</p>
-      <h1>{_escape(novel['title'])}</h1>
-      <h2>{_escape(novel['author'])}</h2>
-      <dl>
-        <dt>Original file</dt><dd>{_escape(novel['original_filename'])}</dd>
-        <dt>Progress</dt><dd>{done + 1 if count else 0} / {count} sections · {percent}%</dd>
-      </dl>
-      <div class="card-progress"><span style="width:{percent}%"></span></div>
-      <h3>Summary</h3>
-      <p class="summary">{_escape(summary or 'Summary will be available after parsing.')}</p>
-      <a class="primary-link" href="/reader/?novel_id={novel['id']}">{read_label}</a>
-    </aside>
+    <div id="detail-modal" class="modal-overlay show" onclick="if(event.target === this) closeModal();">
+      <div class="modal-content">
+        <button class="modal-close" onclick="closeModal();" title="Close modal">&times;</button>
+        
+        <div class="modal-cover-wrapper">
+          {cover_html}
+        </div>
+        
+        <h1 class="modal-title">{_escape(novel['title'])}</h1>
+        
+        <div class="modal-actions">
+          <!-- Star button -->
+          <button class="action-btn star-btn {starred_class}" onclick="document.getElementById('action-star').click();" title="Toggle Star">
+            {star_icon}
+          </button>
+          
+          <!-- Have read button -->
+          <button class="action-btn archive-btn {archived_class}" onclick="document.getElementById('action-archive').click();" title="Toggle Read Status">
+            {archive_icon}
+          </button>
+          
+          <!-- Delete button -->
+          <button class="action-btn delete-btn" onclick="if(confirm('Are you sure you want to delete this book?')) document.getElementById('action-delete').click();" title="Delete Book">
+            {delete_icon}
+          </button>
+          
+          <!-- Continue reading button -->
+          <a class="action-btn continue-btn" href="/reader/?novel_id={novel_id}" title="{read_label}">
+            {continue_icon}
+          </a>
+        </div>
+        
+        <div class="modal-divider"></div>
+        
+        <div class="modal-metadata">
+          {metadata_html}
+        </div>
+      </div>
+    </div>
     """
 
 
-def _summary(novel_id: int) -> str:
-    text = re.sub(r"\s+", " ", store.first_section_text(novel_id)).strip()
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    summary = " ".join(sentences[:3]).strip()
-    return summary[:700] + ("..." if len(summary) > 700 else "")
+def _format_size(bytes_val: int) -> str:
+    if not bytes_val:
+        return "Unknown size"
+    val = float(bytes_val)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if val < 1024:
+            return f"{val:.1f} {unit}"
+        val /= 1024
+    return f"{val:.1f} TB"
+
+
+def _format_date(iso_str: str | None) -> str:
+    if not iso_str:
+        return "Never"
+    try:
+        parts = iso_str.split("T")
+        date_part = parts[0]
+        time_part = parts[1][:5] if len(parts) > 1 else ""
+        return f"{date_part} {time_part}".strip()
+    except Exception:
+        return str(iso_str)
+
 
 
 def _reader_load(request: gr.Request):
@@ -467,6 +647,18 @@ THEME_JS = """
   document.documentElement.setAttribute('data-theme', t);
 
   document.addEventListener("click", function(e) {
+    var card = e.target.closest(".book-card");
+    if (card) {
+      e.preventDefault();
+      var href = card.getAttribute("href");
+      window.history.pushState(null, "", href);
+      var btn = document.getElementById("action-select-novel");
+      if (btn) {
+        btn.click();
+      }
+      return;
+    }
+
     var btn = e.target.closest("[data-theme-set]");
     if (btn) {
       var theme = btn.getAttribute("data-theme-set");
@@ -475,6 +667,18 @@ THEME_JS = """
     }
   });
 })();
+
+function closeModal() {
+  var modal = document.getElementById('detail-modal');
+  if (modal) {
+    modal.classList.remove('show');
+  }
+  window.history.pushState(null, "", "/dashboard/");
+  var btn = document.getElementById("action-clear-select");
+  if (btn) {
+    btn.click();
+  }
+}
 """
 
 CSS = """
@@ -569,23 +773,106 @@ footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn
 .dashboard-theme-selector button { border:1px solid var(--line)!important; background:transparent!important; border-radius:6px!important; color:var(--ink)!important; box-shadow:none!important; text-decoration:none; padding:7px 14px; cursor:pointer; font-size:13px; font-weight:500; transition:all .2s; }
 .dashboard-theme-selector button:hover { background:var(--line)!important; }
 .dashboard h2 { margin:36px 0 12px; font-size:14px; color:var(--muted); text-transform:uppercase; }
-.cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
-.book-card { min-height:190px; display:grid; gap:8px; text-align:left; text-decoration:none; border:1px solid var(--line); border-radius:8px; background:var(--card-bg); color:var(--ink)!important; padding:18px; transition:background .2s,transform .15s,box-shadow .15s; }
-.book-card:hover, .book-card.selected { background:var(--card-hover); transform:translateY(-2px); box-shadow:0 4px 18px rgba(0,0,0,.12); }
-.book-card strong { font:400 24px/1.1 Georgia,serif; color:var(--ink); }
-.book-card span { color:var(--blue); text-transform:uppercase; font-size:12px; }
-.book-card small, .book-card em, .empty, .summary { color:var(--muted); font-style:normal; }
-.book-card i, .card-progress, .progress { height:2px; background:var(--line); overflow:hidden; }
-.book-card b, .card-progress span, .progress span { display:block; height:100%; background:var(--blue); }
-.detail { width:min(1120px,calc(100vw - 48px)); margin:8px auto 24px; padding:24px; border:1px solid var(--line); border-radius:8px; background:var(--card-bg); color:var(--ink); }
-.detail p, .detail h1, .detail h2 { margin:0; }
-.detail > p { color:var(--blue); text-transform:uppercase; font-size:12px; }
-.detail h1 { font:400 42px/1.05 Georgia,serif; margin-top:6px; color:var(--ink); }
-.detail h2 { color:var(--muted); font-size:16px; font-weight:400; }
-.detail dl { display:grid; grid-template-columns:120px 1fr; gap:8px 16px; margin:20px 0; color:var(--muted); }
-.detail dt { color:var(--ink); }
-.detail h3 { margin:22px 0 8px; font-size:13px; color:var(--muted); text-transform:uppercase; }
-.primary-link { display:inline-block; margin-top:18px; color:var(--blue)!important; text-decoration:none; }
+.cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:24px 18px; }
+
+/* Book Card */
+.book-card { display:flex; flex-direction:column; text-decoration:none; border:1px solid var(--line); border-radius:12px; background:var(--card-bg); color:var(--ink)!important; overflow:hidden; transition:all 0.25s cubic-bezier(0.4, 0, 0.2, 1); box-shadow:0 2px 8px rgba(0,0,0,0.04); height: 100%; position: relative; }
+.book-card:hover, .book-card.selected { background:var(--card-hover); transform:translateY(-4px); box-shadow:0 8px 24px rgba(0,0,0,0.12); border-color: var(--blue); }
+
+.card-cover-container { width:100%; aspect-ratio:3/4; overflow:hidden; background:var(--paper); border-bottom:1px solid var(--line); position:relative; display:flex; align-items:center; justify-content:center; }
+.book-cover-img { width:100%; height:100%; object-fit:cover; transition: transform 0.3s ease; }
+.book-card:hover .book-cover-img { transform: scale(1.03); }
+
+/* Star badge inside card cover */
+.star-badge { position:absolute; top:8px; right:8px; background:rgba(242, 201, 76, 0.95); color:#2b2118; width:26px; height:26px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:bold; box-shadow:0 2px 6px rgba(0,0,0,0.15); z-index: 5; }
+
+/* Fallback Text Cover */
+.book-cover-fallback { width:100%; height:100%; padding:16px; display:flex; flex-direction:column; justify-content:space-between; box-sizing:border-box; background:var(--paper); font-family:Georgia, serif; color:var(--ink); overflow:hidden; position:relative; }
+.book-cover-fallback::before { content:''; position:absolute; top:0; left:0; right:0; bottom:0; background:linear-gradient(90deg, rgba(0,0,0,0.04) 0%, rgba(255,255,255,0.06) 1.5%, rgba(0,0,0,0.02) 3%, transparent 4%, rgba(0,0,0,0.03) 98%, rgba(0,0,0,0.08) 100%); pointer-events:none; }
+.fallback-header { font-size:10px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); text-align:center; }
+.fallback-title { font-size:16px; font-weight:bold; text-align:center; margin:8px 0 4px; line-height:1.2; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; max-height: 3.6em; }
+.fallback-divider { width:30px; height:1px; background:var(--muted); margin:4px auto; opacity:0.5; }
+.fallback-body { font-size:10px; line-height:1.4; color:var(--muted); text-align:justify; opacity:0.85; overflow:hidden; display:-webkit-box; -webkit-line-clamp:6; -webkit-box-orient:vertical; height: 8.4em; }
+.fallback-footer { font-size:10px; font-style:italic; text-align:center; color:var(--muted); margin-top: auto; }
+
+.card-info { padding:14px; display:flex; flex-direction:column; gap:4px; flex-grow:1; }
+.card-format { color:var(--blue); font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; }
+.card-title { font:500 16px/1.25 Georgia,serif; color:var(--ink); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height: 2.5em; }
+.card-author { color:var(--muted); font-size:12px; display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+.card-progress { height:3px; background:var(--line); overflow:hidden; border-radius:1.5px; margin-top:8px; }
+.card-progress b { display:block; height:100%; background:var(--blue); }
+.card-progress-text { font-size:10px; color:var(--muted); align-self:flex-end; margin-top:2px; }
+
+/* ── Modal Dialog ──────────────────────────────────────────────────── */
+.modal-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0, 0, 0, 0.4); display:none; align-items:center; justify-content:center; z-index:99999; padding:20px; box-sizing:border-box; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); animation:fadeIn 0.25s ease-out; }
+.modal-overlay.show { display:flex; }
+
+.modal-content { background:var(--paper); color:var(--ink); width:100%; max-width:520px; border-radius:20px; box-shadow:0 20px 50px rgba(0,0,0,0.3); border:1px solid var(--line); position:relative; box-sizing:border-box; padding:36px 32px 28px; text-align:center; max-height:90vh; overflow-y:auto; animation:slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
+
+/* Scrollbar styling for modal */
+.modal-content::-webkit-scrollbar { width:6px; }
+.modal-content::-webkit-scrollbar-track { background:transparent; }
+.modal-content::-webkit-scrollbar-thumb { background:var(--line); border-radius:3px; }
+
+.modal-close { position:absolute; top:16px; right:16px; width:32px; height:32px; border-radius:50%; border:none; background:rgba(0,0,0,0.03); color:var(--ink); font-size:24px; font-weight:300; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:all 0.2s; z-index:10; }
+.modal-close:hover { background:var(--line); transform:scale(1.05); }
+
+.modal-cover-wrapper { width:190px; aspect-ratio:3/4; margin:0 auto 24px; border-radius:12px; overflow:hidden; box-shadow:0 8px 24px rgba(0,0,0,0.15); border:1px solid var(--line); background:var(--bg); }
+.modal-cover-wrapper .book-cover-fallback { padding: 16px; }
+.modal-cover-wrapper .fallback-title { font-size: 15px; }
+.modal-cover-wrapper .fallback-body { font-size: 9.5px; -webkit-line-clamp: 5; height: 7em; }
+
+.modal-title { font:400 28px/1.25 Georgia,serif; color:var(--ink); margin:0 0 24px; padding:0 10px; }
+
+.modal-actions { display:flex; justify-content:center; align-items:center; gap:20px; margin:0 auto 28px; }
+.action-btn { width:54px!important; height:54px!important; border-radius:50%!important; border:1.5px solid var(--muted)!important; background:var(--bg)!important; color:var(--ink)!important; display:flex!important; align-items:center!important; justify-content:center!important; cursor:pointer!important; transition:all 0.2s cubic-bezier(0.4, 0, 0.2, 1)!important; text-decoration:none!important; box-sizing:border-box!important; box-shadow:0 2px 10px rgba(0,0,0,0.05)!important; padding:0!important; }
+.action-btn:hover { transform:translateY(-2px)!important; box-shadow:0 6px 16px rgba(0,0,0,0.12)!important; border-color:var(--ink)!important; background:var(--paper)!important; }
+
+/* Force standard action icons to follow the ink color on all internal strokes */
+.action-btn .icon-svg { width:24px!important; height:24px!important; stroke:var(--ink)!important; color:var(--ink)!important; }
+.action-btn .icon-svg path,
+.action-btn .icon-svg circle { stroke:var(--ink)!important; stroke-width:2.2px!important; fill:none!important; }
+
+/* Star Button States */
+.star-btn.active .icon-svg,
+.star-btn.active .icon-svg path { fill:#f2c94c!important; stroke:#f2c94c!important; }
+.star-btn:hover, .star-btn.active { border-color:#f2c94c!important; }
+.star-btn:hover .icon-svg,
+.star-btn:hover .icon-svg path { stroke:#f2c94c!important; }
+.star-btn.active { background:rgba(242, 201, 76, 0.15)!important; }
+
+/* Archive Button States */
+.archive-btn.active .icon-svg,
+.archive-btn.active .icon-svg path,
+.archive-btn.active .icon-svg circle { fill:var(--blue)!important; stroke:var(--blue)!important; }
+.archive-btn:hover, .archive-btn.active { border-color:var(--blue)!important; }
+.archive-btn:hover .icon-svg,
+.archive-btn:hover .icon-svg path,
+.archive-btn:hover .icon-svg circle { stroke:var(--blue)!important; }
+.archive-btn.active { background:rgba(47, 128, 237, 0.15)!important; }
+
+/* Delete Button States */
+.delete-btn:hover { border-color:#eb5757!important; background:rgba(235, 87, 87, 0.15)!important; }
+.delete-btn:hover .icon-svg,
+.delete-btn:hover .icon-svg path { stroke:#eb5757!important; }
+
+/* Continue Button (Play Icon) */
+.continue-btn { background:var(--blue)!important; border-color:var(--blue)!important; }
+.continue-btn .icon-svg { stroke:none!important; color:#ffffff!important; }
+.continue-btn .icon-svg path { fill:#ffffff!important; stroke:none!important; }
+.continue-btn:hover { background:var(--blue)!important; opacity:0.95!important; }
+
+.modal-divider { height:1px; background:var(--line); width:100%; margin-bottom:24px; }
+
+.modal-metadata { display:flex; flex-direction:column; gap:12px; text-align:left; padding:0 6px; }
+.meta-row { display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px dashed rgba(0,0,0,0.05); padding-bottom:6px; font-size:14px; }
+html[data-theme=dark] .meta-row { border-bottom-color:rgba(255,255,255,0.05); }
+.meta-label { color:var(--muted); font-weight:normal; }
+.meta-value { color:var(--ink); font-weight:500; text-align:right; max-width:70%; word-break:break-word; }
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
 /* ── Reader layout ────────────────────────────────────────────────── */
 .reader-grid { min-height:100vh; gap:0!important; }
 .chapter-rail { background:var(--rail-bg)!important; color:var(--rail-fg)!important; padding:18px 0!important; border-right:1px solid var(--rail-border); }
