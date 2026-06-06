@@ -248,6 +248,20 @@ class LibraryStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_sections_full(self, novel_id: int) -> list[dict[str, Any]]:
+        """Return all sections with full text (for novel parsing pipeline)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT section_index, title, text
+                FROM sections
+                WHERE novel_id = ?
+                ORDER BY section_index
+                """,
+                (novel_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def section_count(self, novel_id: int) -> int:
         with self.connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM sections WHERE novel_id = ?", (novel_id,)).fetchone()[0])

@@ -8,3 +8,6 @@ __pycache__/
 data/reader.sqlite3
 data/novels/
 *.log
+.env
+qwen/
+chatterbox-trying/

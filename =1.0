@@ -1,0 +1,39 @@
+Collecting psycopg[binary,pool]
+  Downloading psycopg-3.3.4-py3-none-any.whl (213 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 213.0/213.0 KB 1.0 MB/s eta 0:00:00
+Requirement already satisfied: pydantic in ./.venv/lib/python3.10/site-packages (2.13.4)
+Collecting pydantic-settings
+  Downloading pydantic_settings-2.14.1-py3-none-any.whl (60 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 61.0/61.0 KB 2.4 MB/s eta 0:00:00
+Collecting openai
+  Downloading openai-2.41.0-py3-none-any.whl (1.4 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.4/1.4 MB 1.5 MB/s eta 0:00:00
+Collecting python-dotenv
+  Downloading python_dotenv-1.2.2-py3-none-any.whl (22 kB)
+Requirement already satisfied: typing-extensions>=4.6 in ./.venv/lib/python3.10/site-packages (from psycopg[binary,pool]) (4.15.0)
+Collecting psycopg-pool
+  Downloading psycopg_pool-3.3.1-py3-none-any.whl (40 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40.0/40.0 KB 1.2 MB/s eta 0:00:00
+Collecting psycopg-binary==3.3.4
+  Downloading psycopg_binary-3.3.4-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (5.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.2/5.2 MB 1.0 MB/s eta 0:00:00
+Requirement already satisfied: annotated-types>=0.6.0 in ./.venv/lib/python3.10/site-packages (from pydantic) (0.7.0)
+Requirement already satisfied: typing-inspection>=0.4.2 in ./.venv/lib/python3.10/site-packages (from pydantic) (0.4.2)
+Requirement already satisfied: pydantic-core==2.46.4 in ./.venv/lib/python3.10/site-packages (from pydantic) (2.46.4)
+Collecting sniffio
+  Downloading sniffio-1.3.1-py3-none-any.whl (10 kB)
+Requirement already satisfied: tqdm>4 in ./.venv/lib/python3.10/site-packages (from openai) (4.67.3)
+Requirement already satisfied: httpx<1,>=0.23.0 in ./.venv/lib/python3.10/site-packages (from openai) (0.28.1)
+Requirement already satisfied: anyio<5,>=3.5.0 in ./.venv/lib/python3.10/site-packages (from openai) (4.13.0)
+Collecting distro<2,>=1.7.0
+  Downloading distro-1.9.0-py3-none-any.whl (20 kB)
+Collecting jiter<1,>=0.10.0
+  Downloading jiter-0.15.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (349 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 349.6/349.6 KB 2.4 MB/s eta 0:00:00
+Requirement already satisfied: idna>=2.8 in ./.venv/lib/python3.10/site-packages (from anyio<5,>=3.5.0->openai) (3.15)
+Requirement already satisfied: exceptiongroup>=1.0.2 in ./.venv/lib/python3.10/site-packages (from anyio<5,>=3.5.0->openai) (1.3.1)
+Requirement already satisfied: httpcore==1.* in ./.venv/lib/python3.10/site-packages (from httpx<1,>=0.23.0->openai) (1.0.9)
+Requirement already satisfied: certifi in ./.venv/lib/python3.10/site-packages (from httpx<1,>=0.23.0->openai) (2026.4.22)
+Requirement already satisfied: h11>=0.16 in ./.venv/lib/python3.10/site-packages (from httpcore==1.*->httpx<1,>=0.23.0->openai) (0.16.0)
+Installing collected packages: sniffio, python-dotenv, psycopg-pool, psycopg-binary, psycopg, jiter, distro, pydantic-settings, openai
+Successfully installed distro-1.9.0 jiter-0.15.0 openai-2.41.0 psycopg-3.3.4 psycopg-binary-3.3.4 psycopg-pool-3.3.1 pydantic-settings-2.14.1 python-dotenv-1.2.2 sniffio-1.3.1

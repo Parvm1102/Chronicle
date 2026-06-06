@@ -3,3 +3,10 @@ ebooklib>=0.18
 beautifulsoup4>=4.12
 pymupdf>=1.24
 Pillow>=10.0
+
+# novel_parser dependencies
+psycopg[binary,pool]>=3.1
+pydantic>=2.0
+pydantic-settings>=2.0
+openai>=1.0
+python-dotenv>=1.0

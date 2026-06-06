@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+import os
 import threading
 from pathlib import Path
 
 from .config import SUPPORTED_FORMATS
 from .parsers import extract_cover_info, parse_book
 from .storage import LibraryStore
+
+logger = logging.getLogger(__name__)
 
 
 class IngestionPipeline:
@@ -48,5 +52,39 @@ class IngestionPipeline:
             except Exception:
                 # Non-fatal: cover extraction failures should not break ingestion
                 self.store.save_extra_metadata(novel_id, file_size=file_size)
+
+            # ── Trigger novel parsing pipeline (if enabled) ───────────
+            self._maybe_trigger_parsing(novel_id)
+
         except Exception as exc:
             self.store.set_status(novel_id, "error", str(exc))
+
+    def _maybe_trigger_parsing(self, novel_id: int) -> None:
+        """Optionally trigger the two-pass LLM parsing pipeline.
+
+        Gated by ENABLE_NOVEL_PARSING env var.  Runs in a separate thread
+        so it does not block the reader UI.
+        """
+        if os.environ.get("ENABLE_NOVEL_PARSING", "false").lower() != "true":
+            return
+
+        novel = self.store.get_novel(novel_id)
+        if not novel:
+            return
+
+        # Gather sections for the parser
+        sections = self.store.list_sections_full(novel_id)
+
+        try:
+            from novel_parser.pipeline import trigger_parsing_async
+
+            trigger_parsing_async(
+                novel_uuid=novel["uuid"],
+                sections=sections,
+                novel_title=novel["title"],
+            )
+            logger.info("Triggered novel parsing for '%s'", novel["title"])
+        except ImportError:
+            logger.debug("novel_parser package not available — skipping parsing")
+        except Exception as exc:
+            logger.warning("Failed to trigger novel parsing: %s", exc)
