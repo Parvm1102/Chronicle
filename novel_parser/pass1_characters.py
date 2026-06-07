@@ -23,6 +23,7 @@ from .models import (
     ConsolidationResult,
     ExtractedCharacter,
     NarratorDetection,
+    Pass1SectionExtraction,
 )
 from .voice_actors import VoiceActorAssigner
 
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 _EXTRACTION_SYSTEM = """\
 You are a literary analyst extracting characters from a novel, chapter by chapter.
-You must respond ONLY with valid JSON matching the schema below.
+You must respond ONLY with valid JSON matching the schema below. Do NOT output any preamble, markdown code blocks, XML tags, conversational intro/outro, or thinking/reasoning thoughts. Start your response directly with the opening brace '{'.
 """
 
 _EXTRACTION_USER = """\
@@ -59,7 +60,7 @@ Tasks:
  updated description, or role changes. Only include characters that have new information. Be conservative with role changes.
 4. Write a 2-3 sentence summary of this chapter's key events.
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON. Do NOT think out loud, write markdown lists, or output reasoning before outputting the JSON. Start your response immediately with the opening curly brace '{{' of the JSON:
 {{
   "new_characters": [
     {{"name": "...", "aliases": [...], "gender": "...", "age_range": "...",\
@@ -76,7 +77,7 @@ Respond ONLY with valid JSON:
 _CONSOLIDATION_SYSTEM = """\
 You are a literary analyst performing a final review of all characters extracted from a novel.
 Your task is to merge duplicates, finalise roles, and detect the narrator type.
-Respond ONLY with valid JSON.
+Respond ONLY with valid JSON. Do NOT output any preamble, markdown code blocks, XML tags, conversational intro/outro, or thinking/reasoning thoughts. Start your response directly with the opening brace '{'.
 """
 
 _CONSOLIDATION_USER = """\
@@ -100,13 +101,18 @@ Tasks:
    - major: Important characters with significant dialogue or plot influence (e.g., Haymitch, Gale, Primrose, Rue, Effie).
    - minor: All other characters (background figures, guards, townspeople, etc. e.g., Madge, Octavia, Flavius). Almost all characters should be minor or major. Do NOT over-assign protagonist/deuteragonist/antagonist roles.
    description (comprehensive summary across all chapters).
-3. Determine the narrator type:
-   - "character": if the novel is narrated in first person by a character in the story.\
- Provide that character's name.
-   - "external": if the novel uses third-person or omniscient narration.
-   Provide brief reasoning.
+   Do NOT create characters for non-person voices (PA systems, machines, broadcasts, signs, announcements).
+3. Determine the narrator type based ONLY on the actual story chapters\
+ (ignore dedications, prefaces, author notes, epigraphs, introductions):
+   - "character": if the story is narrated in first person ("I did this", "I saw that").\
+ The narrator IS one of the characters in your consolidated list — identify exactly which\
+ one by name. Do NOT treat the narrator as a separate person from the character.
+   - "external": if the story uses third-person or omniscient narration.
+   Clue: If the chapter summaries consistently describe events from one character's\
+ first-person perspective ("I", "me", "my"), that character is the first-person narrator.\
+ The narrator_character_name must EXACTLY match one of the character names in your list.
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON. Do NOT think out loud, write markdown lists, or output reasoning before outputting the JSON. Start your response immediately with the opening curly brace '{{' of the JSON:
 {{
   "characters": [
     {{"name": "...", "aliases": [...], "gender": "...", "age_range": "...",\
@@ -161,6 +167,36 @@ class CharacterExtractor:
         rolling_summary = ""
         chapter_summaries: list[str] = []
 
+        # ── Check for saved intermediate results (crash-safe resume) ──────
+        saved_extractions = self._db.get_pass1_extractions(novel_meta_id)
+        saved_section_indices: set[int] = set()
+        if saved_extractions:
+            logger.info("Pass 1: found %d saved extractions — replaying", len(saved_extractions))
+            for row in saved_extractions:
+                sec_idx = row["section_index"]
+                data = row["extraction_json"]
+                saved_section_indices.add(sec_idx)
+
+                # Replay new characters
+                for char_data in data.get("new_characters", []):
+                    char = ExtractedCharacter.model_validate(char_data)
+                    if not self._find_existing(accumulated_chars, char.name, char.aliases):
+                        accumulated_chars.append(self._extracted_to_dict(char, section_idx=sec_idx))
+
+                # Replay updated characters
+                for char_data in data.get("updated_characters", []):
+                    char = ExtractedCharacter.model_validate(char_data)
+                    existing = self._find_existing(accumulated_chars, char.name, char.aliases)
+                    if existing:
+                        self._merge_update(existing, char)
+
+                # Replay summary
+                summary = data.get("chapter_summary", "")
+                if summary:
+                    chapter_summaries.append(f"Chapter {sec_idx + 1}: {summary}")
+
+            rolling_summary = "\n".join(chapter_summaries[-5:])
+
         # Update progress
         self._db.upsert_parse_progress(
             novel_meta_id, pass_number=1,
@@ -171,6 +207,16 @@ class CharacterExtractor:
             section_index = section.get("section_index", idx)
             chapter_title = section.get("title", f"Section {idx + 1}")
             chapter_text = section.get("text", "")
+
+            # Skip already-processed sections
+            if section_index in saved_section_indices:
+                logger.info("Pass 1: skipping section %d (already saved)", section_index)
+                self._db.upsert_parse_progress(
+                    novel_meta_id, pass_number=1,
+                    current_section=idx + 1, total_sections=total,
+                    status="running",
+                )
+                continue
 
             if not chapter_text.strip():
                 chapter_summaries.append(f"Chapter {idx + 1}: [empty]")
@@ -211,6 +257,11 @@ class CharacterExtractor:
                 chapter_summaries.append(f"Chapter {idx + 1}: [extraction failed]")
                 continue
 
+            # ── Persist extraction immediately (crash-safe) ───────────────
+            self._db.save_pass1_extraction(
+                novel_meta_id, section_index, result.model_dump()
+            )
+
             # Merge new characters
             for char in result.new_characters:
                 if not self._find_existing(accumulated_chars, char.name, char.aliases):
@@ -249,6 +300,9 @@ class CharacterExtractor:
             novel_meta_id, consolidated, series_id
         )
 
+        # ── Clean up temporary extraction data ─────────────────────────────
+        self._db.delete_pass1_extractions(novel_meta_id)
+
         # Mark complete
         self._db.mark_progress_complete(novel_meta_id, pass_number=1)
         logger.info("Pass 1 complete: %d characters stored", len(stored_chars))
@@ -279,19 +333,29 @@ class CharacterExtractor:
                 "description": desc,
             })
 
+        # Truncate each chapter summary to keep the overall payload context compact
+        short_summaries = []
+        for s in chapter_summaries:
+            if len(s) > 150:
+                short_summaries.append(s[:150] + "...")
+            else:
+                short_summaries.append(s)
+
         user_msg = _CONSOLIDATION_USER.format(
             novel_title=novel_title,
             all_characters_json=json.dumps(slim_chars, indent=2),
-            chapter_summaries="\n".join(chapter_summaries),
+            chapter_summaries="\n".join(short_summaries),
         )
 
         try:
+            # Consolidation handles a large character list + summaries, so we allow a generous timeout
             return self._llm.chat_structured(
                 messages=[
                     {"role": "system", "content": _CONSOLIDATION_SYSTEM},
                     {"role": "user", "content": user_msg},
                 ],
                 response_model=ConsolidationResult,
+                timeout=300.0,
             )
         except Exception as exc:
             logger.error("Consolidation LLM error: %s — using raw characters", exc)
@@ -325,64 +389,83 @@ class CharacterExtractor:
         narrator = result.narrator
         narrator_char_id: int | None = None
 
-        # Store each character
-        for char in result.characters:
-            is_narrator = False
-            if narrator.narrator_type == "character" and narrator.narrator_character_name:
-                norm_narrator = narrator.narrator_character_name.lower().strip()
-                char_name_lower = char.name.lower().strip()
-                char_aliases_lower = [a.lower().strip() for a in char.aliases]
-                if (
-                    norm_narrator == char_name_lower
-                    or norm_narrator in char_aliases_lower
-                    or char_name_lower in norm_narrator
-                ):
-                    is_narrator = True
+        with self._db.connection() as conn:
+            with conn.transaction():
+                # Store each character
+                for char in result.characters:
+                    is_narrator = False
+                    if narrator.narrator_type == "character" and narrator.narrator_character_name:
+                        norm_narrator = narrator.narrator_character_name.lower().strip()
+                        char_name_lower = char.name.lower().strip()
+                        char_aliases_lower = [a.lower().strip() for a in char.aliases]
+                        if (
+                            norm_narrator == char_name_lower
+                            or norm_narrator in char_aliases_lower
+                            or char_name_lower in norm_narrator
+                        ):
+                            is_narrator = True
 
-            char_id = self._db.insert_character(
-                novel_meta_id,
-                name=char.name,
-                aliases=char.aliases,
-                gender=char.gender,
-                age_range=char.age_range,
-                role=char.role,
-                description=char.description,
-                series_id=series_id,
-                is_narrator=is_narrator,
-            )
+                    char_id = self._db.insert_character(
+                        novel_meta_id,
+                        name=char.name,
+                        aliases=char.aliases,
+                        gender=char.gender,
+                        age_range=char.age_range,
+                        role=char.role,
+                        description=char.description,
+                        series_id=series_id,
+                        is_narrator=is_narrator,
+                        conn=conn,
+                    )
 
-            # Track narrator character id
-            if is_narrator:
-                narrator_char_id = char_id
+                    # Track narrator character id
+                    if is_narrator:
+                        narrator_char_id = char_id
 
-            # Create base profile
-            self._db.insert_character_profile(
-                char_id,
-                novel_meta_id,
-                section_index=0,
-                profile_type="base",
-                summary=char.description,
-                status="active",
-            )
+                    # Create base profile
+                    self._db.insert_character_profile(
+                        char_id,
+                        novel_meta_id,
+                        section_index=0,
+                        profile_type="base",
+                        summary=char.description,
+                        status="active",
+                        conn=conn,
+                    )
 
-        # If external narrator, create a NARRATOR character
-        if narrator.narrator_type == "external":
-            narrator_char_id = self._db.insert_character(
-                novel_meta_id,
-                name="NARRATOR",
-                gender="unknown",
-                role="narrator",
-                description="External omniscient narrator",
-                series_id=series_id,
-                is_narrator=True,
-            )
+                # If external narrator, create a NARRATOR character
+                if narrator.narrator_type == "external":
+                    narrator_char_id = self._db.insert_character(
+                        novel_meta_id,
+                        name="NARRATOR",
+                        gender="unknown",
+                        role="narrator",
+                        description="External omniscient narrator",
+                        series_id=series_id,
+                        is_narrator=True,
+                        conn=conn,
+                    )
 
-        # Update novels_meta with narrator info
-        self._db.set_narrator_info(
-            novel_meta_id,
-            narrator_type=narrator.narrator_type,
-            narrator_character_id=narrator_char_id,
-        )
+                # Update novels_meta with narrator info
+                self._db.set_narrator_info(
+                    novel_meta_id,
+                    narrator_type=narrator.narrator_type,
+                    narrator_character_id=narrator_char_id,
+                    conn=conn,
+                )
+
+                # Always create a MISC_VOICE character for non-person speakers
+                # (PA systems, machines, broadcasts, signs, crowd chants, etc.)
+                self._db.insert_character(
+                    novel_meta_id,
+                    name="MISC_VOICE",
+                    gender="unknown",
+                    role="misc_voice",
+                    description="Miscellaneous non-character voices (PA systems, machines, broadcasts, signs, crowd chants)",
+                    series_id=series_id,
+                    is_narrator=False,
+                    conn=conn,
+                )
 
         return self._db.get_characters(novel_meta_id)
 

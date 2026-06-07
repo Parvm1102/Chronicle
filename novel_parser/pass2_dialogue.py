@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any, Optional
 
 from .database import DatabaseManager
@@ -45,27 +46,45 @@ CHATTERBOX_TAGS = [
 _ANALYSIS_SYSTEM = """\
 You are an expert audiobook producer analysing novel text for TTS production.
 You must identify speakers, emotions, and inject Chatterbox TTS tags.
-Respond ONLY with valid JSON matching the schema below.
+Respond ONLY with valid JSON matching the schema below. Do NOT output any preamble, markdown code blocks, XML tags, conversational intro/outro, or thinking/reasoning thoughts. Start your response directly with the opening brace '{'.
 """
 
 _ANALYSIS_USER = """\
 KNOWN CHARACTERS (use these exact names for speaker identification):
 {characters_json}
 
-RECENT DIALOGUE HISTORY (for speaker continuity context):
+PRECEDING TEXT (context only — do NOT analyse):
+{prev_chunk_text}
+
+RECENT SPEAKER HISTORY (for continuity):
 {history_lines}
 
 --- ANALYSE THIS TEXT ---
 {chunk_text}
 --- END ---
 
-UPCOMING TEXT (lookahead — do NOT analyse, only use for context):
+UPCOMING TEXT (context only — do NOT analyse):
 {lookahead}
 
-For EACH text block above (separated by blank lines or marked as dialogue/narration),\
- provide an entry with:
+CRITICAL RULE — SPLITTING MIXED PARAGRAPHS:
+When a paragraph contains BOTH dialogue and narration interleaved, you MUST\
+ split them into separate entries in reading order. Example:
+
+Input: "Look what I shot," Gale holds up a loaf of bread with an arrow stuck\
+ in it, and I laugh.
+
+Expected output (2 entries):
+  1. entry_type: "dialogue", speaker: "Gale", original_text: "Look what I shot,"
+  2. entry_type: "narration", speaker: "NARRATOR", original_text: "Gale holds up a loaf of bread with an arrow stuck in it, and I laugh."
+
+Every distinct dialogue quote MUST be a separate entry from the surrounding\
+ narration. Never merge dialogue and narration into one entry.
+
+For EACH text segment (in reading order), provide an entry with:
 - entry_type: "dialogue" | "narration" | "thought" | "action"
-- speaker: character name from the KNOWN CHARACTERS list, or "NARRATOR" for narration
+- speaker: character name from the KNOWN CHARACTERS list, or "NARRATOR" for narration,\
+ or "MISC_VOICE" for non-character speakers (PA systems, machine voices, TV/radio broadcasts,\
+ crowd chants, written signs/letters read aloud)
 - emotion + emotion_intensity: MUST be a valid combination from the list below
 - raw_text: the spoken/narrated text with Chatterbox TTS tags injected where appropriate
 - original_text: the exact source text (unchanged)
@@ -95,7 +114,7 @@ EVENTS — if a significant plot event occurs, include in "events":
 - importance: minor/moderate/major/critical
 - spoiler_level: 0-10
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON. Do NOT think out loud, write markdown lists, or output reasoning before outputting the JSON. Start your response immediately with the opening curly brace '{{' of the JSON:
 {{
   "entries": [
     {{"entry_type": "...", "speaker": "...", "emotion": "...", "emotion_intensity": "...",\
@@ -115,11 +134,13 @@ class DialogueAnalyzer:
         db: DatabaseManager,
         llm: LLMClient,
         history_size: int = 8,
+        concurrency: int = 4,
     ) -> None:
         self._db = db
         self._llm = llm
         self._splitter = TextSplitter()
         self._history_size = history_size
+        self._concurrency = concurrency
 
     def run(
         self,
@@ -135,238 +156,379 @@ class DialogueAnalyzer:
             characters: Character dicts from PostgreSQL (after Pass 1).
         """
         total = len(sections)
-        logger.info("Pass 2: starting dialogue analysis for %d sections", total)
+        logger.info("Pass 2: starting dialogue analysis for %d sections with concurrency %d", total, self._concurrency)
 
         # Build character reference for prompts
         char_prompt_data = self._build_char_prompt_data(characters)
         char_name_to_id = self._build_name_map(characters)
 
-        # Sliding dialogue history
-        history: list[str] = []
+        # Get the set of already completed section indices in the database
+        completed_sections = self._db.get_completed_dialogue_sections(novel_meta_id)
+        if completed_sections:
+            logger.info(
+                "Pass 2: resuming — %d sections already completed in DB",
+                len(completed_sections),
+            )
 
-        # Global sequence counter across sections
-        global_seq = 0
+        # Pre-calculate block counts for all sections to assign global_seq deterministically
+        section_block_counts = []
+        for idx, section in enumerate(sections):
+            text = section.get("text", "")
+            blocks = self._splitter.split(text)
+            section_block_counts.append(len(blocks))
 
-        # Update progress
+        # Initialise completed sections counter (pre-populated with skipped sections)
+        self._completed_sections = len(completed_sections)
+
+        # Update initial progress
         self._db.upsert_parse_progress(
             novel_meta_id, pass_number=2,
-            total_sections=total, status="running",
+            current_section=self._completed_sections, total_sections=total,
+            status="running",
         )
 
+        completed_sections_lock = threading.Lock()
+
+        # Identify sections that need to be processed
+        sections_to_process = []
         for sec_idx, section in enumerate(sections):
             section_index = section.get("section_index", sec_idx)
-            section_title = section.get("title", f"Section {sec_idx + 1}")
-            section_text = section.get("text", "")
-
-            if not section_text.strip():
-                self._db.upsert_parse_progress(
-                    novel_meta_id, pass_number=2,
-                    current_section=sec_idx + 1, total_sections=total,
-                    status="running",
-                )
+            if section_index in completed_sections:
+                logger.info("Pass 2: skipping section %d (already completed)", section_index)
                 continue
 
-            logger.info(
-                "Pass 2: section %d/%d — '%s'", sec_idx + 1, total, section_title
-            )
-
-            # Split section into blocks, then chunks
-            blocks = self._splitter.split(section_text)
-            chunks = self._splitter.split_into_chunks(blocks)
-
-            for chunk_idx, chunk_blocks in enumerate(chunks):
-                # Build context
-                chunk_text = self._format_chunk(chunk_blocks)
-
-                # Lookahead: next chunk's text
-                lookahead = ""
-                if chunk_idx + 1 < len(chunks):
-                    lookahead = self._format_chunk(chunks[chunk_idx + 1])
-                elif sec_idx + 1 < total:
-                    # Peek at start of next section
-                    next_text = sections[sec_idx + 1].get("text", "")
-                    if next_text:
-                        next_blocks = self._splitter.split(next_text)
-                        if next_blocks:
-                            lookahead = self._format_chunk(next_blocks[:3])
-
-                # Call LLM
-                try:
-                    result = self._analyse_chunk(
-                        char_prompt_data, history, chunk_text, lookahead
+            # If section text is blank, we can just treat it as completed
+            section_text = section.get("text", "")
+            if not section_text.strip():
+                logger.info("Pass 2: skipping section %d (empty text)", section_index)
+                with completed_sections_lock:
+                    self._completed_sections += 1
+                    self._db.upsert_parse_progress(
+                        novel_meta_id, pass_number=2,
+                        current_section=self._completed_sections, total_sections=total,
+                        status="running",
                     )
-                except Exception as exc:
-                    logger.error(
-                        "Pass 2 LLM error on section %d chunk %d: %s",
-                        sec_idx + 1, chunk_idx + 1, exc,
-                    )
-                    # Store blocks as-is with unknown speaker
-                    for block in chunk_blocks:
-                        self._db.insert_dialogue_entry(
-                            novel_meta_id, section_index, global_seq,
-                            entry_type=block.block_type,
-                            raw_text=block.text,
-                            original_text=block.text,
-                            speaker_name="UNKNOWN",
-                            emotion="neutral",
-                            emotion_intensity="low",
-                            llm_confidence=0.0,
+                continue
+
+            # Calculate the starting sequence number for this section
+            start_seq = sum(section_block_counts[:sec_idx])
+            sections_to_process.append((sec_idx, section, start_seq))
+
+        if sections_to_process:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self._concurrency) as executor:
+                # Submit tasks to executor
+                futures = {
+                    executor.submit(
+                        self._process_section,
+                        novel_meta_id,
+                        sec_idx,
+                        section,
+                        start_seq,
+                        char_prompt_data,
+                        char_name_to_id,
+                        total,
+                        sections,
+                        completed_sections_lock,
+                    ): sec_idx
+                    for sec_idx, section, start_seq in sections_to_process
+                }
+
+                # Check results and raise exceptions if any occurred in the threads
+                for future in concurrent.futures.as_completed(futures):
+                    sec_idx = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        logger.error(
+                            "Pass 2: Section %d failed with exception: %s",
+                            sec_idx + 1, exc, exc_info=True
                         )
-                        global_seq += 1
-                    continue
-
-                # Align original blocks with LLM entries to prevent skipping
-                unmatched_entries = list(result.entries)
-
-                for block in chunk_blocks:
-                    best_entry = None
-                    best_score = 0.0
-
-                    # Find the LLM entry that matches this original block best
-                    for entry in unmatched_entries:
-                        orig = (entry.original_text or entry.raw_text or "").strip()
-                        if not orig:
-                            continue
-
-                        # Score based on word overlap ratio
-                        block_words = set(block.text.lower().split())
-                        entry_words = set(orig.lower().split())
-                        if not block_words or not entry_words:
-                            score = 0.0
-                        else:
-                            intersection = block_words & entry_words
-                            score = len(intersection) / max(len(block_words), len(entry_words))
-
-                        # Boost score if one string fully contains the other
-                        if orig.lower() in block.text.lower() or block.text.lower() in orig.lower():
-                            score += 0.5
-
-                        if score > best_score:
-                            best_score = score
-                            best_entry = entry
-
-                    # Use matched LLM entry if it meets a similarity threshold
-                    if best_entry and best_score > 0.3:
-                        unmatched_entries.remove(best_entry)
-
-                        speaker_name = best_entry.speaker or ("NARRATOR" if block.block_type == "narration" else "UNKNOWN")
-                        speaker_id = char_name_to_id.get(speaker_name)
-
-                        # Validate and snap emotion/intensity
-                        emotion, intensity = resolve_emotion_intensity(
-                            best_entry.emotion, best_entry.emotion_intensity
-                        )
-
-                        # Resolve associated characters
-                        assoc_ids = [
-                            char_name_to_id[n]
-                            for n in (best_entry.associated_characters or [])
-                            if n in char_name_to_id
-                        ]
-
-                        # Detect Chatterbox tags from best_entry.raw_text and inject into original text
-                        raw_text = block.text
-                        entry_raw = best_entry.raw_text or ""
-                        for tag in CHATTERBOX_TAGS:
-                            if tag in entry_raw:
-                                raw_text = f"{tag} {raw_text}"
-                                break
-
-                        self._db.insert_dialogue_entry(
-                            novel_meta_id, section_index, global_seq,
-                            entry_type=block.block_type,
-                            raw_text=raw_text,
-                            original_text=block.text,
-                            speaker_id=speaker_id,
-                            speaker_name=speaker_name,
-                            emotion=emotion,
-                            emotion_intensity=intensity,
-                            associated_characters=assoc_ids,
-                            context_before="\n".join(history[-2:]) if history else "",
-                            context_after=lookahead[:200] if lookahead else "",
-                            llm_confidence=best_entry.confidence or 0.5,
-                        )
-
-                        # Update history buffer
-                        history_line = (
-                            f"{speaker_name}: {emotion}_{intensity} — "
-                            f"{raw_text[:60]}..."
-                            if len(raw_text) > 60
-                            else f"{speaker_name}: {emotion}_{intensity} — {raw_text}"
-                        )
-                        history.append(history_line)
-                        if len(history) > self._history_size:
-                            history = history[-self._history_size:]
-
-                    else:
-                        # Fallback for this specific block: keep original text, default metadata
-                        speaker_name = "NARRATOR" if block.block_type == "narration" else "UNKNOWN"
-                        speaker_id = char_name_to_id.get(speaker_name)
-
-                        self._db.insert_dialogue_entry(
-                            novel_meta_id, section_index, global_seq,
-                            entry_type=block.block_type,
-                            raw_text=block.text,
-                            original_text=block.text,
-                            speaker_id=speaker_id,
-                            speaker_name=speaker_name,
-                            emotion="neutral",
-                            emotion_intensity="low",
-                            associated_characters=[],
-                            context_before="\n".join(history[-2:]) if history else "",
-                            context_after=lookahead[:200] if lookahead else "",
-                            llm_confidence=0.0,
-                        )
-
-                    global_seq += 1
-
-                # Store profile updates
-                for update in result.profile_updates:
-                    char_id = char_name_to_id.get(update.character_name)
-                    if char_id:
-                        self._db.insert_character_profile(
-                            char_id, novel_meta_id, section_index,
-                            profile_type="update",
-                            emotional_state=update.emotional_state,
-                            relationships=update.relationships,
-                            knowledge=update.knowledge,
-                            status=update.status,
-                            summary=update.summary,
-                        )
-
-                # Store events
-                for evt_idx, event in enumerate(result.events):
-                    involved_ids = [
-                        char_name_to_id[n]
-                        for n in event.characters_involved
-                        if n in char_name_to_id
-                    ]
-                    speaker_ids = [
-                        char_name_to_id[n]
-                        for n in event.speakers
-                        if n in char_name_to_id
-                    ]
-                    self._db.insert_event(
-                        novel_meta_id, section_index,
-                        sequence_number=global_seq + evt_idx,
-                        event_type=event.event_type,
-                        summary=event.summary,
-                        characters_involved=involved_ids,
-                        speakers=speaker_ids,
-                        importance=event.importance,
-                        spoiler_level=event.spoiler_level,
-                    )
-
-            # Update progress
-            self._db.upsert_parse_progress(
-                novel_meta_id, pass_number=2,
-                current_section=sec_idx + 1, total_sections=total,
-                status="running",
-            )
+                        raise exc
 
         # Mark complete
         self._db.mark_progress_complete(novel_meta_id, pass_number=2)
-        logger.info("Pass 2 complete: %d entries stored", global_seq)
+        total_blocks = sum(section_block_counts)
+        logger.info("Pass 2 complete: %d blocks processed across all sections", total_blocks)
+
+    def _process_section(
+        self,
+        novel_meta_id: int,
+        sec_idx: int,
+        section: dict[str, Any],
+        start_seq: int,
+        char_prompt_data: str,
+        char_name_to_id: dict[str, int],
+        total: int,
+        sections: list[dict[str, Any]],
+        completed_sections_lock: threading.Lock,
+    ) -> None:
+        section_index = section.get("section_index", sec_idx)
+        section_title = section.get("title", f"Section {sec_idx + 1}")
+        section_text = section.get("text", "")
+
+        logger.info(
+            "Pass 2: processing section %d/%d — '%s'", sec_idx + 1, total, section_title
+        )
+
+        blocks = self._splitter.split(section_text)
+        chunks = self._splitter.split_into_chunks(blocks)
+
+        history: list[str] = []
+        prev_chunk_text = ""
+
+        # Seed prev_chunk_text with the last chunk of the previous section
+        if sec_idx > 0:
+            prev_sec_text = sections[sec_idx - 1].get("text", "")
+            if prev_sec_text:
+                prev_blocks = self._splitter.split(prev_sec_text)
+                if prev_blocks:
+                    prev_chunks = self._splitter.split_into_chunks(prev_blocks)
+                    if prev_chunks:
+                        prev_chunk_text = self._format_chunk(prev_chunks[-1])
+
+        # Prepare lists to buffer inserts
+        dialogue_inserts = []
+        profile_inserts = []
+        event_inserts = []
+
+        local_seq = start_seq
+
+        for chunk_idx, chunk_blocks in enumerate(chunks):
+            chunk_text = self._format_chunk(chunk_blocks)
+
+            # Lookahead: next chunk's text
+            lookahead = ""
+            if chunk_idx + 1 < len(chunks):
+                lookahead = self._format_chunk(chunks[chunk_idx + 1])
+            elif sec_idx + 1 < total:
+                # Peek at start of next section
+                next_text = sections[sec_idx + 1].get("text", "")
+                if next_text:
+                    next_blocks = self._splitter.split(next_text)
+                    if next_blocks:
+                        lookahead = self._format_chunk(next_blocks[:3])
+
+            # Call LLM
+            try:
+                result = self._analyse_chunk(
+                    char_prompt_data, history, chunk_text, lookahead,
+                    prev_chunk_text=prev_chunk_text,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Pass 2 LLM error on section %d chunk %d: %s",
+                    sec_idx + 1, chunk_idx + 1, exc,
+                )
+                # Store blocks as-is with unknown speaker
+                for block in chunk_blocks:
+                    dialogue_inserts.append({
+                        "entry_type": block.block_type,
+                        "raw_text": block.text,
+                        "original_text": block.text,
+                        "speaker_id": char_name_to_id.get("UNKNOWN"),
+                        "speaker_name": "UNKNOWN",
+                        "emotion": "neutral",
+                        "emotion_intensity": "low",
+                        "associated_characters": [],
+                        "context_before": "\n".join(history[-2:]) if history else "",
+                        "context_after": lookahead[:200] if lookahead else "",
+                        "llm_confidence": 0.0,
+                        "sequence_number": local_seq,
+                    })
+                    local_seq += 1
+                continue
+
+            # Align original blocks with LLM entries to prevent skipping
+            unmatched_entries = list(result.entries)
+
+            for block in chunk_blocks:
+                best_entry = None
+                best_score = 0.0
+
+                for entry in unmatched_entries:
+                    orig = (entry.original_text or entry.raw_text or "").strip()
+                    if not orig:
+                        continue
+
+                    block_words = set(block.text.lower().split())
+                    entry_words = set(orig.lower().split())
+                    if not block_words or not entry_words:
+                        score = 0.0
+                    else:
+                        intersection = block_words & entry_words
+                        score = len(intersection) / max(len(block_words), len(entry_words))
+
+                    if orig.lower() in block.text.lower() or block.text.lower() in orig.lower():
+                        score += 0.5
+
+                    if score > best_score:
+                        best_score = score
+                        best_entry = entry
+
+                if best_entry and best_score > 0.3:
+                    unmatched_entries.remove(best_entry)
+
+                    speaker_name = best_entry.speaker or ("NARRATOR" if block.block_type == "narration" else "UNKNOWN")
+                    speaker_id = char_name_to_id.get(speaker_name)
+
+                    emotion, intensity = resolve_emotion_intensity(
+                        best_entry.emotion, best_entry.emotion_intensity
+                    )
+
+                    assoc_ids = [
+                        char_name_to_id[n]
+                        for n in (best_entry.associated_characters or [])
+                        if n in char_name_to_id
+                    ]
+
+                    raw_text = block.text
+                    entry_raw = best_entry.raw_text or ""
+                    for tag in CHATTERBOX_TAGS:
+                        if tag in entry_raw:
+                            raw_text = f"{tag} {raw_text}"
+                            break
+
+                    dialogue_inserts.append({
+                        "entry_type": block.block_type,
+                        "raw_text": raw_text,
+                        "original_text": block.text,
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker_name,
+                        "emotion": emotion,
+                        "emotion_intensity": intensity,
+                        "associated_characters": assoc_ids,
+                        "context_before": "\n".join(history[-2:]) if history else "",
+                        "context_after": lookahead[:200] if lookahead else "",
+                        "llm_confidence": best_entry.confidence or 0.5,
+                        "sequence_number": local_seq,
+                    })
+
+                    history_line = (
+                        f"{speaker_name}: {emotion}_{intensity} — "
+                        f"{raw_text[:60]}..."
+                        if len(raw_text) > 60
+                        else f"{speaker_name}: {emotion}_{intensity} — {raw_text}"
+                    )
+                    history.append(history_line)
+                    if len(history) > self._history_size:
+                        history = history[-self._history_size:]
+
+                else:
+                    speaker_name = "NARRATOR" if block.block_type == "narration" else "UNKNOWN"
+                    speaker_id = char_name_to_id.get(speaker_name)
+
+                    dialogue_inserts.append({
+                        "entry_type": block.block_type,
+                        "raw_text": block.text,
+                        "original_text": block.text,
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker_name,
+                        "emotion": "neutral",
+                        "emotion_intensity": "low",
+                        "associated_characters": [],
+                        "context_before": "\n".join(history[-2:]) if history else "",
+                        "context_after": lookahead[:200] if lookahead else "",
+                        "llm_confidence": 0.0,
+                        "sequence_number": local_seq,
+                    })
+
+                local_seq += 1
+
+            # Store profile updates
+            for update in result.profile_updates:
+                char_id = char_name_to_id.get(update.character_name)
+                if char_id:
+                    profile_inserts.append({
+                        "character_id": char_id,
+                        "profile_type": "update",
+                        "emotional_state": update.emotional_state,
+                        "relationships": update.relationships,
+                        "knowledge": update.knowledge,
+                        "status": update.status,
+                        "summary": update.summary,
+                    })
+
+            # Store events
+            for evt_idx, event in enumerate(result.events):
+                involved_ids = [
+                    char_name_to_id[n]
+                    for n in event.characters_involved
+                    if n in char_name_to_id
+                ]
+                speaker_ids = [
+                    char_name_to_id[n]
+                    for n in event.speakers
+                    if n in char_name_to_id
+                ]
+                event_inserts.append({
+                    "sequence_number": local_seq + evt_idx,
+                    "event_type": event.event_type,
+                    "summary": event.summary,
+                    "characters_involved": involved_ids,
+                    "speakers": speaker_ids,
+                    "importance": event.importance,
+                    "spoiler_level": event.spoiler_level,
+                })
+
+            prev_chunk_text = chunk_text
+
+        # ── Write all data for the section to DB in a single transaction ──
+        with self._db.connection() as conn:
+            with conn.transaction():
+                for d in dialogue_inserts:
+                    self._db.insert_dialogue_entry(
+                        novel_meta_id,
+                        section_index,
+                        d["sequence_number"],
+                        entry_type=d["entry_type"],
+                        raw_text=d["raw_text"],
+                        original_text=d["original_text"],
+                        speaker_id=d["speaker_id"],
+                        speaker_name=d["speaker_name"],
+                        emotion=d["emotion"],
+                        emotion_intensity=d["emotion_intensity"],
+                        associated_characters=d["associated_characters"],
+                        context_before=d["context_before"],
+                        context_after=d["context_after"],
+                        llm_confidence=d["llm_confidence"],
+                        conn=conn,
+                    )
+                for p in profile_inserts:
+                    self._db.insert_character_profile(
+                        p["character_id"],
+                        novel_meta_id,
+                        section_index,
+                        profile_type=p["profile_type"],
+                        emotional_state=p["emotional_state"],
+                        relationships=p["relationships"],
+                        knowledge=p["knowledge"],
+                        status=p["status"],
+                        summary=p["summary"],
+                        conn=conn,
+                    )
+                for e in event_inserts:
+                    self._db.insert_event(
+                        novel_meta_id,
+                        section_index,
+                        e["sequence_number"],
+                        event_type=e["event_type"],
+                        summary=e["summary"],
+                        characters_involved=e["characters_involved"],
+                        speakers=e["speakers"],
+                        importance=e["importance"],
+                        spoiler_level=e["spoiler_level"],
+                        conn=conn,
+                    )
+
+        # ── Update progress safely ──
+        with completed_sections_lock:
+            self._completed_sections += 1
+            self._db.upsert_parse_progress(
+                novel_meta_id, pass_number=2,
+                current_section=self._completed_sections, total_sections=total,
+                status="running",
+            )
 
     # ── LLM call ───────────────────────────────────────────────────────────
 
@@ -376,6 +538,8 @@ class DialogueAnalyzer:
         history: list[str],
         chunk_text: str,
         lookahead: str,
+        *,
+        prev_chunk_text: str = "",
     ) -> ChunkAnalysisResult:
         """Send a single chunk to the LLM for analysis."""
         history_str = "\n".join(history[-self._history_size:]) if history else "(start of novel)"
@@ -383,6 +547,7 @@ class DialogueAnalyzer:
 
         user_msg = _ANALYSIS_USER.format(
             characters_json=char_prompt_data,
+            prev_chunk_text=prev_chunk_text[:800] if prev_chunk_text else "(start of section)",
             history_lines=history_str,
             chunk_text=chunk_text,
             lookahead=lookahead[:500] if lookahead else "(end of section)",
@@ -402,13 +567,20 @@ class DialogueAnalyzer:
 
     @staticmethod
     def _build_char_prompt_data(characters: list[dict[str, Any]]) -> str:
-        """Build a compact character reference for prompts."""
+        """Build a rich character reference for prompts."""
         chars = []
         for c in characters:
+            desc = c.get("description", "")
+            if len(desc) > 200:
+                desc = desc[:200] + "..."
             entry = {
                 "name": c["name"],
                 "aliases": c.get("aliases", []),
                 "role": c.get("role", "minor"),
+                "gender": c.get("gender", "unknown"),
+                "age_range": c.get("age_range", "unknown"),
+                "description": desc,
+                "is_narrator": c.get("is_narrator", False),
             }
             chars.append(entry)
         return json.dumps(chars, indent=2)
@@ -428,6 +600,10 @@ class DialogueAnalyzer:
         narrator_chars = [c for c in characters if c.get("is_narrator")]
         if narrator_chars:
             name_map["NARRATOR"] = narrator_chars[0]["id"]
+        # Always map MISC_VOICE
+        misc_chars = [c for c in characters if c.get("role") == "misc_voice"]
+        if misc_chars:
+            name_map["MISC_VOICE"] = misc_chars[0]["id"]
         return name_map
 
     @staticmethod

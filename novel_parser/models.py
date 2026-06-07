@@ -124,6 +124,7 @@ class CharacterRole(str, Enum):
     MAJOR = "major"
     MINOR = "minor"
     NARRATOR = "narrator"
+    MISC_VOICE = "misc_voice"
 
 
 class EventType(str, Enum):
@@ -158,6 +159,14 @@ class ExtractedCharacter(BaseModel):
 
 class ChapterExtractionResult(BaseModel):
     """LLM output for a single chapter in Pass 1."""
+    new_characters: list[ExtractedCharacter] = Field(default_factory=list)
+    updated_characters: list[ExtractedCharacter] = Field(default_factory=list)
+    chapter_summary: str = ""
+
+
+class Pass1SectionExtraction(BaseModel):
+    """One chapter's raw extraction result, persisted for crash-safe resumability."""
+    section_index: int
     new_characters: list[ExtractedCharacter] = Field(default_factory=list)
     updated_characters: list[ExtractedCharacter] = Field(default_factory=list)
     chapter_summary: str = ""

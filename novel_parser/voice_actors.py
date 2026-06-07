@@ -258,11 +258,16 @@ class VoiceActorAssigner:
 
         Returns mapping {character_id: voice_actor_id}.
         Major characters get unique actors; minor characters can share.
+        MISC_VOICE gets the least-used actor.
         """
         actors = self._db.get_all_voice_actors()
         if not actors:
             logger.warning("No voice actors in database — skipping assignment")
             return {}
+
+        # Separate MISC_VOICE from regular characters
+        regular_chars = [c for c in characters if c.get("role") != "misc_voice"]
+        misc_chars = [c for c in characters if c.get("role") == "misc_voice"]
 
         # Sort characters: protagonist/deuteragonist/major first
         priority_order = {
@@ -270,7 +275,7 @@ class VoiceActorAssigner:
             "major": 3, "narrator": 4, "minor": 5,
         }
         sorted_chars = sorted(
-            characters,
+            regular_chars,
             key=lambda c: priority_order.get(c.get("role", "minor"), 5),
         )
 
@@ -291,6 +296,18 @@ class VoiceActorAssigner:
                     "protagonist", "deuteragonist", "antagonist", "major", "narrator"
                 ):
                     used_actor_ids.add(best_actor["id"])
+
+        # Assign MISC_VOICE the least-used voice actor
+        if misc_chars:
+            # Count how many times each actor is used in current assignments
+            actor_usage: dict[int, int] = {a["id"]: 0 for a in actors}
+            for actor_id in assignments.values():
+                actor_usage[actor_id] = actor_usage.get(actor_id, 0) + 1
+
+            # Pick the least-used actor
+            least_used_actor_id = min(actor_usage, key=actor_usage.get)  # type: ignore[arg-type]
+            for misc_char in misc_chars:
+                assignments[misc_char["id"]] = least_used_actor_id
 
         # Write assignments to DB
         with self._db.connection() as conn:

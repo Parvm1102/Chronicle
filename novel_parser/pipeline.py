@@ -40,7 +40,9 @@ class NovelParsingPipeline:
         self._voice_assigner = VoiceActorAssigner(db)
         self._char_extractor = CharacterExtractor(db, llm)
         self._dialogue_analyzer = DialogueAnalyzer(
-            db, llm, history_size=self._settings.parse_dialogue_history_size
+            db, llm,
+            history_size=self._settings.parse_dialogue_history_size,
+            concurrency=self._settings.parse_concurrency,
         )
 
     def run(
@@ -128,8 +130,13 @@ class NovelParsingPipeline:
     ) -> None:
         """Resume a previously interrupted parse.
 
-        Checks parse_progress to determine where to restart.
+        Checks parse_progress and pass1_extractions to determine where to restart.
+        Pass 1: Uses incremental extractions saved per-chapter to avoid re-running LLM calls.
+        Pass 2: Uses section-level skipping (DialogueAnalyzer handles this internally).
         """
+        # Ensure voice actors are seeded
+        self._voice_mgr.seed()
+
         meta = self._db.get_novel_meta(novel_uuid)
         if not meta:
             logger.info("Resume: no existing parse — running from scratch")
@@ -150,25 +157,72 @@ class NovelParsingPipeline:
 
         # Check which pass needs resuming
         p1_progress = self._db.get_parse_progress(novel_meta_id, 1)
-        p2_progress = self._db.get_parse_progress(novel_meta_id, 2)
 
         if status == "pass1_running" or (p1_progress and p1_progress["status"] != "complete"):
-            logger.info("Resume: restarting Pass 1 from scratch")
-            self.run(novel_uuid, sections, novel_title, wipe_existing=True)
-            return
+            # Check if we have saved intermediate results
+            saved = self._db.get_pass1_extractions(novel_meta_id)
+            if saved:
+                logger.info(
+                    "Resume: Pass 1 interrupted with %d saved extractions — resuming",
+                    len(saved),
+                )
+            else:
+                logger.info("Resume: Pass 1 interrupted with no saved data — restarting")
+                self._db.wipe_novel_parse_data(novel_meta_id)
 
-        if status == "pass2_running" or (p2_progress and p2_progress["status"] != "complete"):
-            # Pass 1 done, Pass 2 needs restart
-            # For simplicity, re-run Pass 2 from scratch (dialogue entries are upserted)
-            logger.info("Resume: Pass 1 complete, restarting Pass 2")
-            characters = self._db.get_characters(novel_meta_id)
-            self._db.set_parse_status(novel_meta_id, "pass2_running", "Resuming dialogue analysis...")
+            # Check for series context
+            series_info = self._series_mgr.get_series_for_novel(novel_meta_id)
+            series_id: int | None = series_info["id"] if series_info else None
+            book_order: int = series_info["book_order"] if series_info else 1
+
+            prior_characters: list[dict[str, Any]] = []
+            if series_id and book_order > 1:
+                prior_characters = self._series_mgr.get_prior_characters(
+                    series_id, book_order
+                )
+
             try:
+                self._db.set_parse_status(novel_meta_id, "pass1_running", "Resuming character extraction...")
+
+                # CharacterExtractor.run() handles resume internally via pass1_extractions
+                characters = self._char_extractor.run(
+                    novel_meta_id, sections, novel_title,
+                    prior_characters=prior_characters,
+                    series_id=series_id,
+                )
+                logger.info("Resume: Pass 1 complete — %d characters", len(characters))
+
+                # Voice actor assignment
+                assignments = self._voice_assigner.assign_all(novel_meta_id, characters)
+                logger.info("Resume: assigned %d voice actors", len(assignments))
+
+                characters = self._db.get_characters(novel_meta_id)
+
+                self._db.set_parse_status(novel_meta_id, "pass2_running", "Analysing dialogue...")
+
+                # Pass 2 — DialogueAnalyzer.run() handles section-level resume internally
                 self._dialogue_analyzer.run(novel_meta_id, sections, characters)
+                logger.info("Resume: Pass 2 complete")
+
                 self._db.set_parse_status(novel_meta_id, "complete", "Parsing complete")
+
             except Exception as exc:
+                logger.error("Resume pipeline error: %s", exc, exc_info=True)
                 self._db.set_parse_status(novel_meta_id, "error", f"Resume failed: {exc}")
                 raise
+            return
+
+        # Pass 1 complete, Pass 2 needs resuming
+        logger.info("Resume: Pass 1 complete, resuming Pass 2")
+        characters = self._db.get_characters(novel_meta_id)
+        self._db.set_parse_status(novel_meta_id, "pass2_running", "Resuming dialogue analysis...")
+        try:
+            # DialogueAnalyzer.run() handles section-level resume internally
+            self._dialogue_analyzer.run(novel_meta_id, sections, characters)
+            self._db.set_parse_status(novel_meta_id, "complete", "Parsing complete")
+        except Exception as exc:
+            self._db.set_parse_status(novel_meta_id, "error", f"Resume failed: {exc}")
+            raise
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -182,7 +236,8 @@ def trigger_parsing_async(
 ) -> None:
     """Fire-and-forget trigger for the parsing pipeline.
 
-    Runs in a daemon thread so it doesn't block the ingestion flow.
+    Uses resume() for crash-safety — if a prior parse was interrupted,
+    it picks up where it left off instead of restarting from scratch.
     """
     def _run() -> None:
         try:
@@ -191,7 +246,7 @@ def trigger_parsing_async(
             db.init_schema()
             llm = LLMClient(settings)
             pipeline = NovelParsingPipeline(db, llm, settings)
-            pipeline.run(novel_uuid, sections, novel_title)
+            pipeline.resume(novel_uuid, sections, novel_title)
         except Exception as exc:
             logger.error("Async parsing failed: %s", exc, exc_info=True)
         finally:

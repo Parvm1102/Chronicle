@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     parse_max_retries: int = 3
     parse_context_window: int = 3  # paragraphs of lookahead/lookbehind
     parse_dialogue_history_size: int = 8  # sliding window of recent entries
+    parse_concurrency: int = 4  # number of sections to process in parallel
 
     # --- Derived / helpers ---
     @property

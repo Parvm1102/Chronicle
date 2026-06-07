@@ -38,7 +38,7 @@ class LLMClient:
         self._client = OpenAI(
             base_url=self._settings.llm_base_url,
             api_key=api_key,
-            timeout=60.0,
+            timeout=120.0,
         )
         self._model = self._settings.llm_model
         self._temperature = self._settings.llm_temperature
@@ -52,6 +52,7 @@ class LLMClient:
         *,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> str:
         """Send a chat completion and return the assistant's text response.
 
@@ -59,22 +60,36 @@ class LLMClient:
             messages: Standard OpenAI message list (role/content dicts).
             json_mode: If True, instruct the model to return valid JSON.
             max_tokens: Override default max_tokens for this call.
+            timeout: Override default client timeout for this request.
 
         Returns:
             The assistant message content as a string.
         """
         kwargs = self._build_kwargs(messages, json_mode, max_tokens)
-        return self._call_with_retry(kwargs)
+        return self._call_with_retry(kwargs, timeout=timeout)
 
     def chat_json(
         self,
         messages: list[dict[str, str]],
         *,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Chat completion with JSON output, parsed into a dict."""
-        raw = self.chat(messages, json_mode=True, max_tokens=max_tokens)
-        return self._parse_json(raw)
+        """Chat completion with JSON output, parsed into a dict, retrying on parse errors."""
+        import time
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                raw = self.chat(messages, json_mode=True, max_tokens=max_tokens, timeout=timeout)
+                return self._parse_json(raw)
+            except ValueError as exc:
+                last_exc = exc
+                logger.warning(
+                    "JSON parsing failed on attempt %d/3: %s. Retrying...",
+                    attempt, exc
+                )
+                time.sleep(1)
+        raise last_exc or ValueError("Failed to obtain valid JSON after 3 attempts")
 
     def chat_structured(
         self,
@@ -82,13 +97,26 @@ class LLMClient:
         response_model: Type[BaseModel],
         *,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> BaseModel:
         """Chat completion parsed into a Pydantic model.
 
-        Sends in JSON mode and validates the response against *response_model*.
+        Sends in JSON mode and validates the response against *response_model*, retrying on errors.
         """
-        raw_dict = self.chat_json(messages, max_tokens=max_tokens)
-        return response_model.model_validate(raw_dict)
+        import time
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                raw_dict = self.chat_json(messages, max_tokens=max_tokens, timeout=timeout)
+                return response_model.model_validate(raw_dict)
+            except (ValueError, Exception) as exc:
+                last_exc = exc
+                logger.warning(
+                    "Structured validation failed on attempt %d/3: %s. Retrying...",
+                    attempt, exc
+                )
+                time.sleep(1)
+        raise last_exc or ValueError("Failed to obtain valid structured response after 3 attempts")
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -125,7 +153,7 @@ class LLMClient:
 
         return kwargs
 
-    def _call_with_retry(self, kwargs: dict[str, Any]) -> str:
+    def _call_with_retry(self, kwargs: dict[str, Any], timeout: float | None = None) -> str:
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -133,7 +161,10 @@ class LLMClient:
                     "LLM request attempt %d/%d  model=%s",
                     attempt, self._max_retries, self._model,
                 )
-                response = self._client.chat.completions.create(**kwargs)
+                call_kwargs = dict(kwargs)
+                if timeout is not None:
+                    call_kwargs["timeout"] = timeout
+                response = self._client.chat.completions.create(**call_kwargs)
                 content = response.choices[0].message.content or ""
                 logger.debug("LLM response length: %d chars", len(content))
                 return content
@@ -162,6 +193,11 @@ class LLMClient:
         # Handle unclosed thinking blocks at the start of the text
         text = re.sub(r"^<(think|thought|reasoning|thought_process)>[^{]*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
+        # Discard anything before the first '{' to strip unclosed thought process or preamble text
+        start_brace = text.find("{")
+        if start_brace != -1:
+            text = text[start_brace:]
+
         # Try to locate the JSON boundaries using brace matching
         start = text.find("{")
         end = text.rfind("}")
@@ -170,10 +206,14 @@ class LLMClient:
             try:
                 return json.loads(json_str)
             except json.JSONDecodeError as exc:
-                logger.error(
-                    "Brace-extracted substring is not valid JSON: %s\nSubstring: %s",
-                    exc, json_str[:500]
-                )
+                try:
+                    repaired = LLMClient._repair_json(json_str)
+                    return json.loads(repaired)
+                except Exception:
+                    logger.debug(
+                        "Brace-extracted substring is not valid JSON even after repair: %s\nSubstring: %s",
+                        exc, json_str[:500]
+                    )
 
         # Fallback to standard code fence stripping
         if text.startswith("```"):
@@ -190,5 +230,56 @@ class LLMClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
-            logger.error("Failed to parse LLM JSON output: %s\nRaw: %s", exc, raw[:500])
-            raise ValueError(f"LLM returned invalid JSON: {exc}") from exc
+            try:
+                repaired = LLMClient._repair_json(text)
+                return json.loads(repaired)
+            except Exception:
+                logger.error("Failed to parse LLM JSON output: %s\nRaw: %s", exc, raw[:500])
+                raise ValueError(f"LLM returned invalid JSON: {exc}") from exc
+
+    @staticmethod
+    def _repair_json(json_str: str) -> str:
+        """Repair truncated JSON by closing open strings and matching brackets/braces."""
+        json_str = json_str.strip()
+        if not json_str:
+            return json_str
+
+        stack = []
+        in_string = False
+        escaped = False
+        
+        for i, char in enumerate(json_str):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == '{':
+                    stack.append('{')
+                elif char == '[':
+                    stack.append('[')
+                elif char == '}':
+                    if stack and stack[-1] == '{':
+                        stack.pop()
+                elif char == ']':
+                    if stack and stack[-1] == '[':
+                        stack.pop()
+
+        repaired = json_str
+        if in_string:
+            repaired += '"'
+        
+        # Close open containers in reverse order
+        while stack:
+            opener = stack.pop()
+            if opener == "{":
+                repaired += "}"
+            elif opener == "[":
+                repaired += "]"
+                
+        return repaired

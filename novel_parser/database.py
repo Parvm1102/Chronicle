@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS parse_progress (
     UNIQUE(novel_meta_id, pass_number)
 );
 
+-- Incremental Pass 1 extractions (crash-safe resumability)
+CREATE TABLE IF NOT EXISTS pass1_extractions (
+    id              SERIAL PRIMARY KEY,
+    novel_meta_id   INTEGER NOT NULL REFERENCES novels_meta(id) ON DELETE CASCADE,
+    section_index   INTEGER NOT NULL,
+    extraction_json JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(novel_meta_id, section_index)
+);
+
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_characters_novel ON characters(novel_meta_id);
 CREATE INDEX IF NOT EXISTS idx_characters_series ON characters(series_id);
@@ -258,16 +268,19 @@ class DatabaseManager:
         novel_meta_id: int,
         narrator_type: str,
         narrator_character_id: Optional[int] = None,
+        conn: Optional[psycopg.Connection] = None,
     ) -> None:
-        with self.connection() as conn:
-            conn.execute(
-                """
+        query = """
                 UPDATE novels_meta
                 SET narrator_type = %s, narrator_character_id = %s, updated_at = NOW()
                 WHERE id = %s
-                """,
-                (narrator_type, narrator_character_id, novel_meta_id),
-            )
+                """
+        params = (narrator_type, narrator_character_id, novel_meta_id)
+        if conn is not None:
+            conn.execute(query, params)
+        else:
+            with self.connection() as c:
+                c.execute(query, params)
 
     def get_novel_meta(self, novel_uuid: str) -> Optional[dict[str, Any]]:
         with self.connection() as conn:
@@ -297,6 +310,7 @@ class DatabaseManager:
         """
         with self.connection() as conn:
             for table in (
+                "pass1_extractions",
                 "dialogue_entries",
                 "novel_events",
                 "character_profiles",
@@ -319,6 +333,81 @@ class DatabaseManager:
             )
         logger.info("Wiped parse data for novel_meta_id=%s", novel_meta_id)
 
+    # ── pass1 incremental extractions (crash-safe) ─────────────────────────
+
+    def save_pass1_extraction(
+        self, novel_meta_id: int, section_index: int, extraction_dict: dict
+    ) -> None:
+        """Persist one chapter's raw extraction result for resumability."""
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO pass1_extractions (novel_meta_id, section_index, extraction_json)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (novel_meta_id, section_index)
+                DO UPDATE SET extraction_json = EXCLUDED.extraction_json, created_at = NOW()
+                """,
+                (novel_meta_id, section_index, psycopg.types.json.Jsonb(extraction_dict)),
+            )
+
+    def get_pass1_extractions(self, novel_meta_id: int) -> list[dict]:
+        """Fetch all saved Pass 1 extractions, ordered by section_index."""
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT section_index, extraction_json
+                FROM pass1_extractions
+                WHERE novel_meta_id = %s
+                ORDER BY section_index
+                """,
+                (novel_meta_id,),
+            ).fetchall()
+
+    def delete_pass1_extractions(self, novel_meta_id: int) -> None:
+        """Clean up temporary Pass 1 data after consolidation succeeds."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM pass1_extractions WHERE novel_meta_id = %s",
+                (novel_meta_id,),
+            )
+        logger.info("Cleaned up pass1_extractions for novel_meta_id=%s", novel_meta_id)
+
+    # ── dialogue resumability helpers ──────────────────────────────────────
+
+    def get_max_dialogue_section(self, novel_meta_id: int) -> int | None:
+        """Return the highest section_index with dialogue entries, or None."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(section_index) AS max_sec FROM dialogue_entries WHERE novel_meta_id = %s",
+                (novel_meta_id,),
+            ).fetchone()
+            return row["max_sec"] if row and row["max_sec"] is not None else None
+
+    def get_max_dialogue_sequence(self, novel_meta_id: int) -> int:
+        """Return the max sequence_number across all dialogue entries, or -1."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(sequence_number) AS max_seq FROM dialogue_entries WHERE novel_meta_id = %s",
+                (novel_meta_id,),
+            ).fetchone()
+            return int(row["max_seq"]) if row and row["max_seq"] is not None else -1
+
+    def get_completed_dialogue_sections(self, novel_meta_id: int) -> set[int]:
+        """Return a set of section_index values that already have dialogue entries stored."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT section_index FROM dialogue_entries WHERE novel_meta_id = %s",
+                (novel_meta_id,),
+            ).fetchall()
+            return {int(row["section_index"]) for row in rows}
+
+    def get_incomplete_novels(self) -> list[dict]:
+        """Return novels_meta rows with status pass1_running or pass2_running."""
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM novels_meta WHERE parse_status IN ('pass1_running', 'pass2_running')"
+            ).fetchall()
+
     # ── characters ─────────────────────────────────────────────────────────
 
     def insert_character(
@@ -335,10 +424,9 @@ class DatabaseManager:
         is_narrator: bool = False,
         first_appearance_section: int | None = None,
         series_id: int | None = None,
+        conn: Optional[psycopg.Connection] = None,
     ) -> int:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
+        query = """
                 INSERT INTO characters
                     (novel_meta_id, series_id, name, aliases, gender, age_range,
                      role, description, voice_actor_id, is_narrator,
@@ -358,22 +446,27 @@ class DatabaseManager:
                     ),
                     updated_at = NOW()
                 RETURNING id
-                """,
-                (
-                    novel_meta_id,
-                    series_id,
-                    name,
-                    aliases or [],
-                    gender,
-                    age_range,
-                    role,
-                    description,
-                    voice_actor_id,
-                    is_narrator,
-                    first_appearance_section,
-                ),
-            ).fetchone()
+                """
+        params = (
+            novel_meta_id,
+            series_id,
+            name,
+            aliases or [],
+            gender,
+            age_range,
+            role,
+            description,
+            voice_actor_id,
+            is_narrator,
+            first_appearance_section,
+        )
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
             return int(row["id"])  # type: ignore[index]
+        else:
+            with self.connection() as c:
+                row = c.execute(query, params).fetchone()
+                return int(row["id"])  # type: ignore[index]
 
     def get_characters(self, novel_meta_id: int) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -420,10 +513,9 @@ class DatabaseManager:
         knowledge: list[str] | None = None,
         status: str = "",
         summary: str = "",
+        conn: Optional[psycopg.Connection] = None,
     ) -> int:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
+        query = """
                 INSERT INTO character_profiles
                     (character_id, novel_meta_id, section_index, profile_type,
                      emotional_state, relationships, knowledge, status, summary)
@@ -437,20 +529,25 @@ class DatabaseManager:
                     summary         = EXCLUDED.summary,
                     created_at      = NOW()
                 RETURNING id
-                """,
-                (
-                    character_id,
-                    novel_meta_id,
-                    section_index,
-                    profile_type,
-                    emotional_state,
-                    psycopg.types.json.Jsonb(relationships or {}),
-                    knowledge or [],
-                    status,
-                    summary,
-                ),
-            ).fetchone()
+                """
+        params = (
+            character_id,
+            novel_meta_id,
+            section_index,
+            profile_type,
+            emotional_state,
+            psycopg.types.json.Jsonb(relationships or {}),
+            knowledge or [],
+            status,
+            summary,
+        )
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
             return int(row["id"])  # type: ignore[index]
+        else:
+            with self.connection() as c:
+                row = c.execute(query, params).fetchone()
+                return int(row["id"])  # type: ignore[index]
 
     def get_latest_profiles(
         self,
@@ -516,10 +613,9 @@ class DatabaseManager:
         context_before: str = "",
         context_after: str = "",
         llm_confidence: float = 0.0,
+        conn: Optional[psycopg.Connection] = None,
     ) -> int:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
+        query = """
                 INSERT INTO dialogue_entries
                     (novel_meta_id, section_index, sequence_number, entry_type,
                      raw_text, original_text, speaker_id, speaker_name,
@@ -540,15 +636,20 @@ class DatabaseManager:
                     context_after         = EXCLUDED.context_after,
                     llm_confidence        = EXCLUDED.llm_confidence
                 RETURNING id
-                """,
-                (
-                    novel_meta_id, section_index, sequence_number, entry_type,
-                    raw_text, original_text, speaker_id, speaker_name,
-                    emotion, emotion_intensity, associated_characters or [],
-                    context_before, context_after, llm_confidence,
-                ),
-            ).fetchone()
+                """
+        params = (
+            novel_meta_id, section_index, sequence_number, entry_type,
+            raw_text, original_text, speaker_id, speaker_name,
+            emotion, emotion_intensity, associated_characters or [],
+            context_before, context_after, llm_confidence,
+        )
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
             return int(row["id"])  # type: ignore[index]
+        else:
+            with self.connection() as c:
+                row = c.execute(query, params).fetchone()
+                return int(row["id"])  # type: ignore[index]
 
     def get_dialogue_entries(
         self, novel_meta_id: int, section_index: int
@@ -592,10 +693,9 @@ class DatabaseManager:
         speakers: list[int] | None = None,
         importance: str = "minor",
         spoiler_level: int = 0,
+        conn: Optional[psycopg.Connection] = None,
     ) -> int:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
+        query = """
                 INSERT INTO novel_events
                     (novel_meta_id, section_index, sequence_number, event_type,
                      summary, characters_involved, speakers, importance, spoiler_level)
@@ -609,14 +709,19 @@ class DatabaseManager:
                     importance          = EXCLUDED.importance,
                     spoiler_level       = EXCLUDED.spoiler_level
                 RETURNING id
-                """,
-                (
-                    novel_meta_id, section_index, sequence_number, event_type,
-                    summary, characters_involved or [], speakers or [],
-                    importance, spoiler_level,
-                ),
-            ).fetchone()
+                """
+        params = (
+            novel_meta_id, section_index, sequence_number, event_type,
+            summary, characters_involved or [], speakers or [],
+            importance, spoiler_level,
+        )
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
             return int(row["id"])  # type: ignore[index]
+        else:
+            with self.connection() as c:
+                row = c.execute(query, params).fetchone()
+                return int(row["id"])  # type: ignore[index]
 
     # ── voice actors ───────────────────────────────────────────────────────
 
