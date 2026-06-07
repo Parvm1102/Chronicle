@@ -51,12 +51,12 @@ CURRENT CHAPTER ({chapter_index}/{total_chapters}) — "{chapter_title}":
 ---
 
 Tasks:
-1. Extract ALL named characters appearing in this chapter (new or previously seen).
+1. Extract ALL named characters appearing in this chapter (new or previously seen). Only extract actual characters participating in or present in the story. Do NOT extract historical or famous figures mentioned in passing, fictional characters from other stories referenced in dialogue, or names appearing solely in dedications, prefaces, introductions, or author notes which are not a part of the story.
 2. For new characters: provide name, aliases (other names/titles/nicknames used),\
  gender (male/female/unknown), age_range (child/teen/young/young_adult/adult/middle_aged/elderly/unknown),\
- role_hint (protagonist/deuteragonist/antagonist/major/minor), description.
+ role_hint (protagonist/deuteragonist/antagonist/major/minor — note: protagonist, deuteragonist, and antagonist should only be assigned to the main 1-2 characters of the overall story; almost all other characters should be minor or major), description.
 3. For existing characters from the "CHARACTERS FOUND SO FAR" list: note any new aliases,\
- updated description, or role changes. Only include characters that have new information.
+ updated description, or role changes. Only include characters that have new information. Be conservative with role changes.
 4. Write a 2-3 sentence summary of this chapter's key events.
 
 Respond ONLY with valid JSON:
@@ -93,6 +93,12 @@ Tasks:
    Keep the most commonly used name as the primary name, others as aliases.
 2. For each unique character, provide the final consolidated profile:
    name, aliases, gender, age_range, role (protagonist/deuteragonist/antagonist/major/minor).
+   Guidelines for role:
+   - protagonist: The single main character of the novel (usually exactly 1, e.g., Katniss Everdeen).
+   - deuteragonist: The second most important character (usually only 1 or 2, e.g., Peeta Mellark).
+   - antagonist: The main opponent of the protagonist (usually only 1 or 2, e.g., President Snow / Cato).
+   - major: Important characters with significant dialogue or plot influence (e.g., Haymitch, Gale, Primrose, Rue, Effie).
+   - minor: All other characters (background figures, guards, townspeople, etc. e.g., Madge, Octavia, Flavius). Almost all characters should be minor or major. Do NOT over-assign protagonist/deuteragonist/antagonist roles.
    description (comprehensive summary across all chapters).
 3. Determine the narrator type:
    - "character": if the novel is narrated in first person by a character in the story.\
@@ -162,6 +168,7 @@ class CharacterExtractor:
         )
 
         for idx, section in enumerate(sections):
+            section_index = section.get("section_index", idx)
             chapter_title = section.get("title", f"Section {idx + 1}")
             chapter_text = section.get("text", "")
 
@@ -207,7 +214,7 @@ class CharacterExtractor:
             # Merge new characters
             for char in result.new_characters:
                 if not self._find_existing(accumulated_chars, char.name, char.aliases):
-                    accumulated_chars.append(self._extracted_to_dict(char, section_idx=idx))
+                    accumulated_chars.append(self._extracted_to_dict(char, section_idx=section_index))
 
             # Update existing characters
             for char in result.updated_characters:
@@ -257,9 +264,24 @@ class CharacterExtractor:
         chapter_summaries: list[str],
     ) -> ConsolidationResult:
         """Run the final consolidation LLM call."""
+        # Slim down descriptions in accumulated_chars to prevent context/output truncation
+        slim_chars = []
+        for c in accumulated_chars:
+            desc = c.get("description", "")
+            if len(desc) > 300:
+                desc = desc[:300] + "..."
+            slim_chars.append({
+                "name": c.get("name", ""),
+                "aliases": c.get("aliases", []),
+                "gender": c.get("gender", "unknown"),
+                "age_range": c.get("age_range", "unknown"),
+                "role_hint": c.get("role_hint", "minor"),
+                "description": desc,
+            })
+
         user_msg = _CONSOLIDATION_USER.format(
             novel_title=novel_title,
-            all_characters_json=json.dumps(accumulated_chars, indent=2),
+            all_characters_json=json.dumps(slim_chars, indent=2),
             chapter_summaries="\n".join(chapter_summaries),
         )
 
@@ -305,6 +327,18 @@ class CharacterExtractor:
 
         # Store each character
         for char in result.characters:
+            is_narrator = False
+            if narrator.narrator_type == "character" and narrator.narrator_character_name:
+                norm_narrator = narrator.narrator_character_name.lower().strip()
+                char_name_lower = char.name.lower().strip()
+                char_aliases_lower = [a.lower().strip() for a in char.aliases]
+                if (
+                    norm_narrator == char_name_lower
+                    or norm_narrator in char_aliases_lower
+                    or char_name_lower in norm_narrator
+                ):
+                    is_narrator = True
+
             char_id = self._db.insert_character(
                 novel_meta_id,
                 name=char.name,
@@ -314,19 +348,11 @@ class CharacterExtractor:
                 role=char.role,
                 description=char.description,
                 series_id=series_id,
-                is_narrator=(
-                    narrator.narrator_type == "character"
-                    and narrator.narrator_character_name
-                    and char.name.lower() == narrator.narrator_character_name.lower()
-                ),
+                is_narrator=is_narrator,
             )
 
             # Track narrator character id
-            if (
-                narrator.narrator_type == "character"
-                and narrator.narrator_character_name
-                and char.name.lower() == narrator.narrator_character_name.lower()
-            ):
+            if is_narrator:
                 narrator_char_id = char_id
 
             # Create base profile
@@ -365,13 +391,16 @@ class CharacterExtractor:
     @staticmethod
     def _char_to_prompt_dict(char: dict[str, Any]) -> dict[str, Any]:
         """Slim character dict for inclusion in prompts."""
+        desc = char.get("description", "")
+        if len(desc) > 200:
+            desc = desc[:200] + "..."
         return {
             "name": char.get("name", ""),
             "aliases": char.get("aliases", []),
             "gender": char.get("gender", "unknown"),
             "age_range": char.get("age_range", "unknown"),
             "role_hint": char.get("role_hint", char.get("role", "minor")),
-            "description": char.get("description", ""),
+            "description": desc,
         }
 
     @staticmethod
@@ -422,9 +451,11 @@ class CharacterExtractor:
         if update.age_range != "unknown" and existing.get("age_range") == "unknown":
             existing["age_range"] = update.age_range
         if update.description:
-            existing["description"] = (
-                existing.get("description", "") + " " + update.description
-            ).strip()
+            desc_lower = existing.get("description", "").lower()
+            if update.description.lower() not in desc_lower:
+                existing["description"] = (
+                    existing.get("description", "") + " " + update.description
+                ).strip()
         # Upgrade role if more important
         role_priority = {
             "protagonist": 0, "deuteragonist": 1, "antagonist": 2,

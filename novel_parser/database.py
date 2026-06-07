@@ -187,7 +187,10 @@ class DatabaseManager:
             "conninfo": conninfo,
             "min_size": 1,
             "max_size": 5,
-            "kwargs": {"row_factory": dict_row},
+            "kwargs": {
+                "row_factory": dict_row,
+                "prepare_threshold": None,  # Required for pgBouncer / Supavisor transaction poolers
+            },
         }
         # SSL for Supabase
         ssl_mode = self._settings.postgres_ssl_mode
@@ -272,6 +275,18 @@ class DatabaseManager:
                 "SELECT * FROM novels_meta WHERE novel_uuid = %s",
                 (novel_uuid,),
             ).fetchone()
+
+    def delete_novel_meta(self, novel_uuid: str) -> None:
+        """Delete a novel's metadata and all parsed data from PostgreSQL.
+
+        Uses the ON DELETE CASCADE constraints to clean up all related records.
+        """
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM novels_meta WHERE novel_uuid = %s",
+                (novel_uuid,),
+            )
+        logger.info("Deleted novel_meta for uuid=%s", novel_uuid)
 
     # ── wipe for re-run ───────────────────────────────────────────────────
 

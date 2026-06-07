@@ -145,7 +145,18 @@ class VoiceActorManager:
             )
 
     def _discover_emotions(self, actor_name: str) -> dict[str, list[str]]:
-        """Scan the actor's directory and build an emotion→intensities map."""
+        """Scan the actor's directory and build an emotion→intensities map.
+
+        Returns e.g.::
+
+            {
+                "neutral": [],           # single file, no intensity suffix
+                "happy": ["low", "med", "high"],
+                "mysterious": ["low"],    # only low exists
+                "warm": ["low", "high"],  # no med
+                ...
+            }
+        """
         actor_dir = self._samples_dir / actor_name
         emotions: dict[str, list[str]] = {}
 
@@ -158,10 +169,21 @@ class VoiceActorManager:
             if not m:
                 continue
             emotion = m.group("emotion").lower()
-            intensity = (m.group("intensity") or "low").lower()
-            emotions.setdefault(emotion, []).append(intensity)
+            intensity = m.group("intensity")  # None if no suffix
+            if intensity:
+                emotions.setdefault(emotion, []).append(intensity.lower())
+            else:
+                # e.g. "Aiden_neutral.wav" — no intensity suffix
+                emotions.setdefault(emotion, [])
 
         return emotions
+
+    # Ordered by proximity so fallback picks the closest available intensity
+    _INTENSITY_FALLBACK: dict[str, list[str]] = {
+        "low":  ["low", "med", "high"],
+        "med":  ["med", "low", "high"],  # prefer lower when med missing
+        "high": ["high", "med", "low"],
+    }
 
     def get_sample_path(
         self,
@@ -171,27 +193,45 @@ class VoiceActorManager:
     ) -> Optional[Path]:
         """Resolve the .wav path for a given actor/emotion/intensity.
 
-        Falls back to: exact → nearest intensity → neutral.
+        Fallback chain:
+        1. Exact match (actor_emotion_intensity.wav)
+        2. Nearest available intensity for the same emotion
+        3. Actor's neutral sample
         """
         actor_dir = self._samples_dir / actor_name
 
-        # Try exact match
+        # Emotions without intensity suffix (e.g. neutral)
         if emotion == "neutral":
             exact = actor_dir / f"{actor_name}_neutral.wav"
-        else:
-            exact = actor_dir / f"{actor_name}_{emotion}_{intensity}.wav"
+            return exact if exact.exists() else None
+
+        # Try exact match first
+        exact = actor_dir / f"{actor_name}_{emotion}_{intensity}.wav"
         if exact.exists():
             return exact
 
-        # Fallback: try other intensities for the same emotion
-        for fb_intensity in ("low", "med", "high"):
+        # Fallback: try closest intensity for the same emotion
+        for fb_intensity in self._INTENSITY_FALLBACK.get(intensity, ["low", "med", "high"]):
+            if fb_intensity == intensity:
+                continue  # already tried
             fb = actor_dir / f"{actor_name}_{emotion}_{fb_intensity}.wav"
             if fb.exists():
+                logger.debug(
+                    "Fallback: %s_%s_%s → %s_%s_%s",
+                    actor_name, emotion, intensity,
+                    actor_name, emotion, fb_intensity,
+                )
                 return fb
 
         # Last resort: neutral
         neutral = actor_dir / f"{actor_name}_neutral.wav"
-        return neutral if neutral.exists() else None
+        if neutral.exists():
+            logger.debug(
+                "Fallback to neutral: %s_%s_%s → neutral",
+                actor_name, emotion, intensity,
+            )
+            return neutral
+        return None
 
 
 class VoiceActorAssigner:

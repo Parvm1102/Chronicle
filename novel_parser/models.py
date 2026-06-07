@@ -35,6 +35,81 @@ class EmotionIntensity(str, Enum):
     HIGH = "high"
 
 
+# ── Valid combinations (matches actual voice sample files) ────────────────
+# neutral has no intensity suffix at all (single file per actor).
+# All other emotions have a subset of low/med/high.
+
+VALID_EMOTION_INTENSITIES: dict[EmotionType, list[EmotionIntensity]] = {
+    EmotionType.NEUTRAL:    [],                                                  # single file, no intensity
+    EmotionType.HAPPY:      [EmotionIntensity.LOW, EmotionIntensity.MED, EmotionIntensity.HIGH],
+    EmotionType.ANGRY:      [EmotionIntensity.LOW, EmotionIntensity.MED, EmotionIntensity.HIGH],
+    EmotionType.SAD:        [EmotionIntensity.LOW, EmotionIntensity.MED, EmotionIntensity.HIGH],
+    EmotionType.FEARFUL:    [EmotionIntensity.LOW, EmotionIntensity.MED, EmotionIntensity.HIGH],
+    EmotionType.WARM:       [EmotionIntensity.LOW, EmotionIntensity.HIGH],        # no med
+    EmotionType.SERIOUS:    [EmotionIntensity.LOW, EmotionIntensity.HIGH],        # no med
+    EmotionType.WHISPER:    [EmotionIntensity.LOW, EmotionIntensity.HIGH],        # no med
+    EmotionType.MYSTERIOUS: [EmotionIntensity.LOW],                               # only low
+}
+
+# Human-readable summary for LLM prompts
+EMOTION_INTENSITY_PROMPT_MAP: str = """Available emotion + intensity combinations:
+- neutral (no intensity — use alone)
+- happy: low, med, high
+- angry: low, med, high
+- sad: low, med, high
+- fearful: low, med, high
+- warm: low, high (NO med)
+- serious: low, high (NO med)
+- whisper: low, high (NO med)
+- mysterious: low ONLY (NO med or high)"""
+
+
+def resolve_emotion_intensity(
+    emotion: Optional[str], intensity: Optional[str]
+) -> tuple[str, str]:
+    """Snap an emotion/intensity pair to the nearest valid combination.
+
+    Returns (emotion, intensity) — guaranteed to match an actual voice sample.
+    """
+    if not emotion:
+        emotion = "neutral"
+    if not intensity:
+        intensity = "low"
+
+    # Validate emotion
+    try:
+        emo = EmotionType(emotion.lower())
+    except (ValueError, AttributeError):
+        return EmotionType.NEUTRAL.value, EmotionIntensity.LOW.value
+
+    valid = VALID_EMOTION_INTENSITIES[emo]
+
+    # neutral has no intensity
+    if not valid:
+        return emo.value, EmotionIntensity.LOW.value
+
+    # Check if requested intensity is valid
+    try:
+        inten = EmotionIntensity(intensity.lower())
+    except (ValueError, AttributeError):
+        return emo.value, valid[0].value
+
+    if inten in valid:
+        return emo.value, inten.value
+
+    # Snap to nearest: prefer lower intensity as fallback
+    _PROXIMITY = {
+        EmotionIntensity.LOW:  [EmotionIntensity.LOW, EmotionIntensity.MED, EmotionIntensity.HIGH],
+        EmotionIntensity.MED:  [EmotionIntensity.MED, EmotionIntensity.LOW, EmotionIntensity.HIGH],
+        EmotionIntensity.HIGH: [EmotionIntensity.HIGH, EmotionIntensity.MED, EmotionIntensity.LOW],
+    }
+    for candidate in _PROXIMITY.get(inten, list(EmotionIntensity)):
+        if candidate in valid:
+            return emo.value, candidate.value
+
+    return emo.value, valid[0].value
+
+
 class EntryType(str, Enum):
     DIALOGUE = "dialogue"
     NARRATION = "narration"
@@ -117,34 +192,34 @@ class ConsolidationResult(BaseModel):
 
 class DialogueEntryResult(BaseModel):
     """A single analysed text block from Pass 2."""
-    entry_type: str = "dialogue"
-    speaker: str = "NARRATOR"
-    emotion: str = "neutral"
-    emotion_intensity: str = "low"
-    raw_text: str = ""           # with chatterbox tags injected
-    original_text: str = ""      # source text before tags
+    entry_type: Optional[str] = "dialogue"
+    speaker: Optional[str] = "NARRATOR"
+    emotion: Optional[str] = "neutral"
+    emotion_intensity: Optional[str] = "low"
+    raw_text: Optional[str] = ""           # with chatterbox tags injected
+    original_text: Optional[str] = ""      # source text before tags
     associated_characters: list[str] = Field(default_factory=list)
-    confidence: float = 0.0
+    confidence: Optional[float] = 0.0
 
 
 class ProfileUpdateResult(BaseModel):
     """Profile delta for one character from a chunk."""
     character_name: str
-    emotional_state: str = ""
+    emotional_state: Optional[str] = ""
     relationships: dict[str, str] = Field(default_factory=dict)
     knowledge: list[str] = Field(default_factory=list)
-    status: str = ""
-    summary: str = ""
+    status: Optional[str] = ""
+    summary: Optional[str] = ""
 
 
 class EventResult(BaseModel):
     """A plot event detected in a chunk."""
-    event_type: str = "plot"
-    summary: str = ""
+    event_type: Optional[str] = "plot"
+    summary: Optional[str] = ""
     characters_involved: list[str] = Field(default_factory=list)
     speakers: list[str] = Field(default_factory=list)
-    importance: str = "minor"
-    spoiler_level: int = 0
+    importance: Optional[str] = "minor"
+    spoiler_level: Optional[int] = 0
 
 
 class ChunkAnalysisResult(BaseModel):

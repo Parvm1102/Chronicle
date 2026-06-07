@@ -23,6 +23,7 @@ class LLMProvider(str, Enum):
     """Supported LLM back-ends."""
     OLLAMA = "ollama"
     CLOUD = "cloud"  # Groq, OpenRouter, or any OpenAI-compatible API
+    GEMINI = "gemini"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:11434/v1"
     llm_model: str = "qwen3.5:4b"
     llm_api_key: str = ""
+    gemini_api_key: str = ""
     llm_max_context: int = 8192
     llm_temperature: float = 0.3
     llm_max_retries: int = 3
@@ -66,8 +68,19 @@ class Settings(BaseSettings):
         return self.postgres_ssl if self.postgres_ssl else None
 
     @model_validator(mode="after")
-    def _validate_cloud_key(self) -> "Settings":
-        if self.llm_provider == LLMProvider.CLOUD and not self.llm_api_key:
+    def _validate_llm_settings(self) -> "Settings":
+        if self.llm_provider == LLMProvider.GEMINI:
+            if self.llm_base_url in ("http://localhost:11434/v1", "https://api.groq.com/openai/v1"):
+                self.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            if self.llm_model in ("qwen3.5:4b", "groq/compound"):
+                self.llm_model = "gemini-1.5-flash"
+
+            if not self.gemini_api_key and not self.llm_api_key:
+                raise ValueError(
+                    "GEMINI_API_KEY (or LLM_API_KEY) is required when LLM_PROVIDER=gemini "
+                    "(set it in .env or as an environment variable)"
+                )
+        elif self.llm_provider == LLMProvider.CLOUD and not self.llm_api_key:
             raise ValueError(
                 "LLM_API_KEY is required when LLM_PROVIDER=cloud "
                 "(set it in .env or as an environment variable / HF Space secret)"

@@ -27,14 +27,22 @@ class LLMClient:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._settings = settings or get_settings()
+        self._provider = self._settings.llm_provider
+
+        # Determine the API key (Gemini can use gemini_api_key or fallback to llm_api_key)
+        if self._provider == LLMProvider.GEMINI:
+            api_key = self._settings.gemini_api_key or self._settings.llm_api_key or "not-needed"
+        else:
+            api_key = self._settings.llm_api_key or "not-needed"
+
         self._client = OpenAI(
             base_url=self._settings.llm_base_url,
-            api_key=self._settings.llm_api_key or "not-needed",
+            api_key=api_key,
+            timeout=60.0,
         )
         self._model = self._settings.llm_model
         self._temperature = self._settings.llm_temperature
         self._max_retries = self._settings.llm_max_retries
-        self._provider = self._settings.llm_provider
 
     # ── public API ─────────────────────────────────────────────────────────
 
@@ -95,14 +103,25 @@ class LLMClient:
             "messages": messages,
             "temperature": self._temperature,
         }
-        if max_tokens:
-            kwargs["max_tokens"] = max_tokens
+        # Use a generous default of 4096 to prevent response truncation in Ollama / cloud providers
+        kwargs["max_tokens"] = max_tokens if max_tokens is not None else 4096
 
         if json_mode:
             # Both Groq and Ollama support this format;
             # Ollama also accepts format="json" but the OpenAI-compat
             # endpoint handles response_format fine.
             kwargs["response_format"] = {"type": "json_object"}
+
+        if self._provider == LLMProvider.OLLAMA:
+            # Ollama expects options like num_ctx in extra_body when using the OpenAI-compatible endpoint
+            kwargs["extra_body"] = {
+                "options": {
+                    "num_ctx": self._settings.llm_max_context,
+                    "num_predict": max_tokens if max_tokens is not None else 4096
+                }
+            }
+            # Disable thinking for Ollama models to prevent conflicts with JSON mode and slowdowns.
+            kwargs["reasoning_effort"] = "none"
 
         return kwargs
 
@@ -134,20 +153,42 @@ class LLMClient:
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
-        """Parse JSON from LLM output, handling markdown fences."""
+        """Parse JSON from LLM output, handling thinking tags, code fences, and conversational wrappers."""
+        import re
         text = raw.strip()
-        # Strip markdown code fences if present
+
+        # Remove thinking blocks if present (e.g. <think>...</think>, <thought>...</thought>, etc.)
+        text = re.sub(r"<(think|thought|reasoning|thought_process)>.*?</\1>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        # Handle unclosed thinking blocks at the start of the text
+        text = re.sub(r"^<(think|thought|reasoning|thought_process)>[^{]*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+        # Try to locate the JSON boundaries using brace matching
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            json_str = text[start : end + 1]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "Brace-extracted substring is not valid JSON: %s\nSubstring: %s",
+                    exc, json_str[:500]
+                )
+
+        # Fallback to standard code fence stripping
         if text.startswith("```"):
             lines = text.split("\n")
-            # Remove first and last lines (fences)
             if lines[-1].strip() == "```":
                 lines = lines[1:-1]
             elif lines[0].startswith("```"):
                 lines = lines[1:]
             text = "\n".join(lines).strip()
+            # If the fence was like ```json, strip the 'json' line if it remains
+            if text.startswith("json"):
+                text = text[4:].strip()
 
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
-            logger.error("Failed to parse LLM JSON output: %s\nRaw: %s", exc, text[:500])
+            logger.error("Failed to parse LLM JSON output: %s\nRaw: %s", exc, raw[:500])
             raise ValueError(f"LLM returned invalid JSON: {exc}") from exc

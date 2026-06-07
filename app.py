@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)  # must be before any module reads env vars
+
 import gradio as gr
 import uvicorn
 from fastapi import FastAPI

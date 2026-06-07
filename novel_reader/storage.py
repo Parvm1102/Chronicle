@@ -326,6 +326,17 @@ class LibraryStore:
             conn.execute("DELETE FROM sections WHERE novel_id = ?", (novel_id,))
             conn.execute("DELETE FROM novels WHERE id = ?", (novel_id,))
         if novel:
+            try:
+                from novel_parser.config import get_settings
+                from novel_parser.database import DatabaseManager
+                settings = get_settings()
+                db = DatabaseManager(settings)
+                db.delete_novel_meta(novel["uuid"])
+                db.close()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to delete novel from PostgreSQL: %s", e)
+
             novel_dir = Path(str(novel["stored_path"])).parent.parent
             if novel_dir.exists() and novel_dir.parent == NOVELS_DIR:
                 shutil.rmtree(novel_dir)

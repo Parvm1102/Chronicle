@@ -139,7 +139,14 @@ class TextSplitter:
         only if they are short (likely dialogue tags)."""
         # First split on double newlines
         raw_paras = re.split(r"\n\s*\n", text)
-        return [p.strip() for p in raw_paras if p.strip()]
+        raw_paras = [p.strip() for p in raw_paras if p.strip()]
+
+        # If we got only 1 paragraph but there are multiple single newlines, split on single newlines
+        if len(raw_paras) <= 1 and text.count("\n") > 5:
+            raw_paras = re.split(r"\n+", text)
+            raw_paras = [p.strip() for p in raw_paras if p.strip()]
+
+        return raw_paras
 
     @staticmethod
     def _split_dialogue(

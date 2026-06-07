@@ -19,7 +19,11 @@ from typing import Any, Optional
 
 from .database import DatabaseManager
 from .llm_client import LLMClient
-from .models import ChunkAnalysisResult, EmotionIntensity, EmotionType
+from .models import (
+    EMOTION_INTENSITY_PROMPT_MAP,
+    ChunkAnalysisResult,
+    resolve_emotion_intensity,
+)
 from .text_splitter import TextBlock, TextSplitter
 
 logger = logging.getLogger(__name__)
@@ -62,12 +66,13 @@ For EACH text block above (separated by blank lines or marked as dialogue/narrat
  provide an entry with:
 - entry_type: "dialogue" | "narration" | "thought" | "action"
 - speaker: character name from the KNOWN CHARACTERS list, or "NARRATOR" for narration
-- emotion: one of: neutral, warm, happy, angry, sad, fearful, mysterious, serious, whisper
-- emotion_intensity: one of: low, med, high
+- emotion + emotion_intensity: MUST be a valid combination from the list below
 - raw_text: the spoken/narrated text with Chatterbox TTS tags injected where appropriate
 - original_text: the exact source text (unchanged)
 - associated_characters: list of character names present in or referenced by this block
 - confidence: 0.0 to 1.0 (how confident you are about speaker attribution)
+
+{emotion_map}
 
 CHATTERBOX TTS TAGS — inject these INLINE where the source text implies them:
 {tags_list}
@@ -210,47 +215,108 @@ class DialogueAnalyzer:
                         global_seq += 1
                     continue
 
-                # Store entries
-                for entry in result.entries:
-                    # Resolve speaker to character ID
-                    speaker_id = char_name_to_id.get(entry.speaker)
+                # Align original blocks with LLM entries to prevent skipping
+                unmatched_entries = list(result.entries)
 
-                    # Validate emotion/intensity
-                    emotion = self._validate_emotion(entry.emotion)
-                    intensity = self._validate_intensity(entry.emotion_intensity)
+                for block in chunk_blocks:
+                    best_entry = None
+                    best_score = 0.0
 
-                    # Resolve associated character IDs
-                    assoc_ids = [
-                        char_name_to_id[n]
-                        for n in entry.associated_characters
-                        if n in char_name_to_id
-                    ]
+                    # Find the LLM entry that matches this original block best
+                    for entry in unmatched_entries:
+                        orig = (entry.original_text or entry.raw_text or "").strip()
+                        if not orig:
+                            continue
 
-                    self._db.insert_dialogue_entry(
-                        novel_meta_id, section_index, global_seq,
-                        entry_type=entry.entry_type,
-                        raw_text=entry.raw_text,
-                        original_text=entry.original_text,
-                        speaker_id=speaker_id,
-                        speaker_name=entry.speaker,
-                        emotion=emotion,
-                        emotion_intensity=intensity,
-                        associated_characters=assoc_ids,
-                        context_before="\n".join(history[-2:]) if history else "",
-                        context_after=lookahead[:200] if lookahead else "",
-                        llm_confidence=entry.confidence,
-                    )
+                        # Score based on word overlap ratio
+                        block_words = set(block.text.lower().split())
+                        entry_words = set(orig.lower().split())
+                        if not block_words or not entry_words:
+                            score = 0.0
+                        else:
+                            intersection = block_words & entry_words
+                            score = len(intersection) / max(len(block_words), len(entry_words))
 
-                    # Update history buffer
-                    history_line = (
-                        f"{entry.speaker}: {emotion}_{intensity} — "
-                        f"{entry.raw_text[:60]}..."
-                        if len(entry.raw_text) > 60
-                        else f"{entry.speaker}: {emotion}_{intensity} — {entry.raw_text}"
-                    )
-                    history.append(history_line)
-                    if len(history) > self._history_size:
-                        history = history[-self._history_size:]
+                        # Boost score if one string fully contains the other
+                        if orig.lower() in block.text.lower() or block.text.lower() in orig.lower():
+                            score += 0.5
+
+                        if score > best_score:
+                            best_score = score
+                            best_entry = entry
+
+                    # Use matched LLM entry if it meets a similarity threshold
+                    if best_entry and best_score > 0.3:
+                        unmatched_entries.remove(best_entry)
+
+                        speaker_name = best_entry.speaker or ("NARRATOR" if block.block_type == "narration" else "UNKNOWN")
+                        speaker_id = char_name_to_id.get(speaker_name)
+
+                        # Validate and snap emotion/intensity
+                        emotion, intensity = resolve_emotion_intensity(
+                            best_entry.emotion, best_entry.emotion_intensity
+                        )
+
+                        # Resolve associated characters
+                        assoc_ids = [
+                            char_name_to_id[n]
+                            for n in (best_entry.associated_characters or [])
+                            if n in char_name_to_id
+                        ]
+
+                        # Detect Chatterbox tags from best_entry.raw_text and inject into original text
+                        raw_text = block.text
+                        entry_raw = best_entry.raw_text or ""
+                        for tag in CHATTERBOX_TAGS:
+                            if tag in entry_raw:
+                                raw_text = f"{tag} {raw_text}"
+                                break
+
+                        self._db.insert_dialogue_entry(
+                            novel_meta_id, section_index, global_seq,
+                            entry_type=block.block_type,
+                            raw_text=raw_text,
+                            original_text=block.text,
+                            speaker_id=speaker_id,
+                            speaker_name=speaker_name,
+                            emotion=emotion,
+                            emotion_intensity=intensity,
+                            associated_characters=assoc_ids,
+                            context_before="\n".join(history[-2:]) if history else "",
+                            context_after=lookahead[:200] if lookahead else "",
+                            llm_confidence=best_entry.confidence or 0.5,
+                        )
+
+                        # Update history buffer
+                        history_line = (
+                            f"{speaker_name}: {emotion}_{intensity} — "
+                            f"{raw_text[:60]}..."
+                            if len(raw_text) > 60
+                            else f"{speaker_name}: {emotion}_{intensity} — {raw_text}"
+                        )
+                        history.append(history_line)
+                        if len(history) > self._history_size:
+                            history = history[-self._history_size:]
+
+                    else:
+                        # Fallback for this specific block: keep original text, default metadata
+                        speaker_name = "NARRATOR" if block.block_type == "narration" else "UNKNOWN"
+                        speaker_id = char_name_to_id.get(speaker_name)
+
+                        self._db.insert_dialogue_entry(
+                            novel_meta_id, section_index, global_seq,
+                            entry_type=block.block_type,
+                            raw_text=block.text,
+                            original_text=block.text,
+                            speaker_id=speaker_id,
+                            speaker_name=speaker_name,
+                            emotion="neutral",
+                            emotion_intensity="low",
+                            associated_characters=[],
+                            context_before="\n".join(history[-2:]) if history else "",
+                            context_after=lookahead[:200] if lookahead else "",
+                            llm_confidence=0.0,
+                        )
 
                     global_seq += 1
 
@@ -321,6 +387,7 @@ class DialogueAnalyzer:
             chunk_text=chunk_text,
             lookahead=lookahead[:500] if lookahead else "(end of section)",
             tags_list=tags_str,
+            emotion_map=EMOTION_INTENSITY_PROMPT_MAP,
         )
 
         return self._llm.chat_structured(
@@ -369,7 +436,7 @@ class DialogueAnalyzer:
         lines = []
         for block in blocks:
             if block.block_type == "dialogue":
-                lines.append(f'"{block.text}"')
+                lines.append(f'"{ block.text}"')
             elif block.block_type == "thought":
                 lines.append(f"*{block.text}*")
             elif block.block_type == "action":
@@ -377,21 +444,3 @@ class DialogueAnalyzer:
             else:
                 lines.append(block.text)
         return "\n\n".join(lines)
-
-    @staticmethod
-    def _validate_emotion(emotion: str) -> str:
-        """Validate and normalise emotion to the constrained enum."""
-        try:
-            return EmotionType(emotion.lower()).value
-        except ValueError:
-            logger.debug("Unknown emotion '%s', defaulting to neutral", emotion)
-            return EmotionType.NEUTRAL.value
-
-    @staticmethod
-    def _validate_intensity(intensity: str) -> str:
-        """Validate and normalise intensity."""
-        try:
-            return EmotionIntensity(intensity.lower()).value
-        except ValueError:
-            logger.debug("Unknown intensity '%s', defaulting to low", intensity)
-            return EmotionIntensity.LOW.value
