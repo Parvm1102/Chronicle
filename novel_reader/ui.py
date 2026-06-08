@@ -514,11 +514,22 @@ def _top(novel: dict, section: dict | None, state: dict) -> str:
     count = store.section_count(novel["id"]) if novel and novel["status"] == "complete" else 0
     progress = f"{section['section_index'] + 1}/{count}" if section else ""
     title = _clean_chapter_title(section["title"], section["section_index"]) if section else novel["title"]
+    cur_section = section["section_index"] if section else int(state.get("section") or 0)
     return f"""
     <header class="top theme-{state['theme']}">
       <div><small>{_escape(novel['title'])}</small><strong>{_escape(title)}</strong></div>
       <nav>
         <a href="/dashboard/">Dashboard</a>
+        <button class="speaker-trigger" title="Read aloud" data-tts-novel="{novel['id']}" data-tts-section="{cur_section}">
+          <svg class="speaker-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+            <path class="wave-1" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+            <path class="wave-2" d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+          </svg>
+          <svg class="speaker-stop-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor" stroke="none" style="display:none;">
+            <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+          </svg>
+        </button>
         <button data-click="nr-back">Back</button><button data-click="nr-prev">Prev</button>
         <span>{_escape(progress)}</span>
         <button data-click="nr-next">Next</button><button data-click="nr-forward">Forward</button>
@@ -792,10 +803,140 @@ function syncSettingsPopupState() {
   }
 }
 
+// ── TTS read-aloud player ──────────────────────────────────────────────────
+function ttsBtn() { return q(".speaker-trigger"); }
+function ttsEscape(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function ttsSetPlaying(on) { const b = ttsBtn(); if (b) b.classList.toggle("playing", !!on); }
+function ttsSetLoading(on) { const b = ttsBtn(); if (b) b.classList.toggle("loading", !!on); }
+
+function ttsToast(msg) {
+  let t = document.getElementById("tts-toast");
+  if (!t) { t = document.createElement("div"); t.id = "tts-toast"; document.body.appendChild(t); }
+  t.textContent = msg;
+  // force reflow so re-show re-triggers the transition
+  void t.offsetWidth;
+  t.classList.add("show");
+  clearTimeout(window.__ttsToastTimer);
+  window.__ttsToastTimer = setTimeout(() => { t.classList.remove("show"); }, 6000);
+}
+
+function ttsStop(restore) {
+  const s = window.__tts;
+  if (s) {
+    if (s.audio) { try { s.audio.pause(); } catch (e) {} s.audio.onended = null; s.audio.onerror = null; }
+    if (restore && s.originalHTML != null) {
+      const t = q(".text");
+      if (t) t.innerHTML = s.originalHTML;
+    }
+  }
+  window.__tts = { active: false };
+  ttsSetPlaying(false);
+  ttsSetLoading(false);
+}
+
+function ttsToggle() {
+  const s = window.__tts;
+  if (s && s.active) { ttsStop(true); return; }
+  const b = ttsBtn();
+  if (!b) return;
+  ttsLoadSection(b.dataset.ttsNovel, parseInt(b.dataset.ttsSection, 10), true);
+}
+
+async function ttsLoadSection(novelId, section, userInitiated) {
+  ttsSetLoading(true);
+  let data;
+  try {
+    const r = await fetch(`/tts/playlist?novel_id=${novelId}&section=${section}`);
+    data = await r.json();
+  } catch (e) {
+    ttsSetLoading(false);
+    if (userInitiated) ttsToast("TTS service is offline.");
+    ttsStop(true);
+    return;
+  }
+  ttsSetLoading(false);
+  if (data.status !== "ready") {
+    if (userInitiated) ttsToast(data.message || "Parsing in progress…");
+    ttsStop(true);
+    return;
+  }
+  const textEl = q(".text");
+  if (!textEl) { ttsStop(true); return; }
+  if (!data.units || data.units.length === 0) { ttsAdvanceSection(novelId, section); return; }
+
+  const originalHTML = textEl.innerHTML;
+  textEl.innerHTML = data.units.map(u =>
+    `<p class="tts-unit" id="tts-u-${u.seq}" data-seq="${u.seq}">${ttsEscape(u.text)}</p>`
+  ).join("");
+  window.__tts = { active: true, novelId, section, units: data.units, idx: 0, audio: null, nextAudio: null, originalHTML };
+  ttsSetPlaying(true);
+  ttsPlayIdx(0);
+}
+
+function ttsPlayIdx(i) {
+  const s = window.__tts;
+  if (!s || !s.active) return;
+  if (i >= s.units.length) { ttsAdvanceSection(s.novelId, s.section); return; }
+  s.idx = i;
+  document.querySelectorAll(".tts-unit.tts-active").forEach(e => e.classList.remove("tts-active"));
+  const unit = s.units[i];
+  const el = document.getElementById(`tts-u-${unit.seq}`);
+  if (el) { el.classList.add("tts-active"); el.scrollIntoView({ behavior: "smooth", block: "center" }); }
+
+  let audio = (s.nextAudio && s.nextAudio.__url === unit.audio_url) ? s.nextAudio : new Audio(unit.audio_url);
+  audio.__url = unit.audio_url;
+  s.audio = audio;
+  audio.onended = () => ttsPlayIdx(i + 1);
+  audio.onerror = () => ttsPlayIdx(i + 1);
+  audio.play().catch(() => {});
+
+  if (i + 1 < s.units.length) {
+    const n = new Audio();
+    n.__url = s.units[i + 1].audio_url;
+    n.preload = "auto";
+    n.src = s.units[i + 1].audio_url;
+    s.nextAudio = n;
+  } else {
+    s.nextAudio = null;
+  }
+}
+
+// Hand off to the next chapter via the reader's own Next button so the chapter
+// title, progress bar and chapter rail all update. A poller then resumes TTS
+// once the new section has rendered.
+function ttsAdvanceSection(novelId, curSection) {
+  ttsStop(true);
+  ttsSetPlaying(true);
+  ttsSetLoading(true);
+  window.__ttsAuto = { novelId: String(novelId), from: curSection, expect: curSection + 1, tries: 0 };
+  fetch(`/tts/progress?novel_id=${novelId}&section=${curSection + 1}`, { method: "POST" }).catch(() => {});
+  click("nr-next");
+}
+
+function ttsAutoPoll() {
+  const auto = window.__ttsAuto;
+  if (!auto) return;
+  const b = ttsBtn();
+  if (!b) return;
+  const cur = parseInt(b.dataset.ttsSection, 10);
+  if (cur === auto.expect) {
+    window.__ttsAuto = null;
+    ttsSetLoading(false);
+    ttsLoadSection(auto.novelId, auto.expect, false);
+  } else {
+    auto.tries++;
+    // Section never advanced → end of book (or stuck): stop cleanly.
+    if (auto.tries > 8 && cur === auto.from) { window.__ttsAuto = null; ttsStop(true); }
+    else if (auto.tries > 40) { window.__ttsAuto = null; ttsStop(true); }
+  }
+}
+
 function bootReader() {
   if (window.__readerBooted) return;
   window.__readerBooted = true;
-  
+
   const bar = document.createElement("div");
   bar.id = "select-bar";
   document.body.appendChild(bar);
@@ -815,8 +956,17 @@ function bootReader() {
   // Poll for bookmark targets and keep settings open state synchronized
   setInterval(checkAndScrollBookmark, 300);
   setInterval(syncSettingsPopupState, 50);
+  setInterval(ttsAutoPoll, 150);
 
   document.addEventListener("click", (event) => {
+    // Read-aloud speaker toggle
+    const speaker = event.target.closest(".speaker-trigger");
+    if (speaker) {
+      event.preventDefault();
+      ttsToggle();
+      return;
+    }
+
     // Intercept bookmarks clicks inside the settings popup
     const bookmarkItem = event.target.closest(".bookmark-item");
     if (bookmarkItem) {
@@ -875,6 +1025,12 @@ function bootReader() {
 
     const proxy = event.target.closest("[data-click]");
     if (proxy) {
+      // A manual navigation/theme/font click while reading aloud: stop TTS so the
+      // re-rendered page isn't left with stale highlighted units. (Auto-advance
+      // sets window.__ttsAuto and is exempt.)
+      if (window.__tts && window.__tts.active && !window.__ttsAuto) {
+        ttsStop(false);
+      }
       const themeKey = THEMES[proxy.dataset.click];
       if (themeKey) applyTheme(themeKey);
       click(proxy.dataset.click);
@@ -1425,6 +1581,55 @@ READER_CSS = CSS + """
   stroke-width: 2.2px !important;
   fill: none !important;
 }
+/* Speaker / read-aloud button */
+.speaker-trigger {
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 50% !important;
+  padding: 0 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  border: 1.5px solid var(--reader-line) !important;
+  background: transparent !important;
+}
+.speaker-trigger svg { display: block; stroke: var(--reader-ink); color: var(--reader-ink); }
+.speaker-trigger.playing {
+  border-color: var(--blue) !important;
+  background: rgba(47, 128, 237, 0.12) !important;
+}
+.speaker-trigger.playing .speaker-icon { display: none !important; }
+.speaker-trigger.playing .speaker-stop-icon { display: block !important; fill: var(--blue); color: var(--blue); }
+.speaker-trigger.loading .speaker-icon { animation: ttsPulse 1s ease-in-out infinite; }
+@keyframes ttsPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* Spoken-unit highlight (rendered while reading aloud) */
+.tts-unit { transition: background-color 0.2s ease, color 0.2s ease; border-radius: 4px; }
+.tts-unit.tts-active {
+  background: rgba(47, 128, 237, 0.18);
+  box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.18);
+}
+[data-theme="dark"] .tts-unit.tts-active { background: rgba(120, 170, 255, 0.22); box-shadow: 0 0 0 3px rgba(120,170,255,.22); }
+
+/* Transient "parse in progress" toast */
+#tts-toast {
+  position: fixed;
+  top: 74px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  z-index: 10000;
+  background: var(--reader-ink);
+  color: var(--reader-bg);
+  padding: 10px 18px;
+  border-radius: 22px;
+  font: 500 14px/1.2 system-ui, sans-serif;
+  box-shadow: 0 8px 24px rgba(0,0,0,.28);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+#tts-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .pdf-page-container {
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12) !important;
   border: 1px solid var(--reader-line) !important;

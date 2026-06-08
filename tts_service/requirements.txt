@@ -1,0 +1,16 @@
+# TTS microservice runtime deps (the thin web layer only).
+#
+# The Chatterbox package itself — and its heavy, pinned ML deps
+# (torch==2.6.0, torchaudio==2.6.0, transformers==5.2.0, diffusers==0.29.0,
+# librosa==0.11.0, safetensors==0.5.3, resemble-perth, conformer==0.3.2, …) —
+# is installed separately from ../chatterbox-trying/chatterbox.
+# See Dockerfile (local container) and modal_app.py (Modal deploy).
+#
+# Local dev without Docker:
+#   pip install ./chatterbox-trying/chatterbox
+#   pip install -r tts_service/requirements.txt
+#   uvicorn tts_service.server:app --host 0.0.0.0 --port 8070
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+soundfile>=0.12

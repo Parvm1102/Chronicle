@@ -23,5 +23,34 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Chatterbox-Turbo TTS microservice (GPU).
+  # Requires the NVIDIA Container Toolkit on the host.
+  # Build context is the repo root so the image can install the local
+  # chatterbox package; the main app reaches it at http://localhost:8070
+  # (or http://tts:8070 from inside the compose network).
+  tts:
+    build:
+      context: .
+      dockerfile: tts_service/Dockerfile
+    ports:
+      - "${TTS_PORT:-8070}:8070"
+    environment:
+      TTS_DEVICE: ${TTS_DEVICE:-cuda}
+      VOICE_SAMPLES_DIR: /voice_samples
+      TTS_CACHE_DIR: /data/tts_cache
+      HF_HOME: /data/hf
+    volumes:
+      - ./voice_samples:/voice_samples:ro
+      - ./data/tts_cache:/data/tts_cache
+      - ./data/hf:/data/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
 volumes:
   pgdata:

@@ -91,6 +91,43 @@ def root_head():
     return RedirectResponse("/dashboard/")
 
 
+# ── TTS narration routes ────────────────────────────────────────────────────
+from fastapi import HTTPException, Query
+from fastapi.responses import JSONResponse, Response
+
+from novel_reader.tts import TTSOrchestrator
+
+_tts = TTSOrchestrator()
+
+
+@app.get("/tts/playlist")
+def tts_playlist(novel_id: int = Query(...), section: int = Query(...)):
+    """Return the ordered, speakable units for a chapter and warm the cache."""
+    result = _tts.build_playlist(novel_id, section)
+    if result.get("status") == "ready":
+        _tts.prefetch(novel_id, section)
+    return JSONResponse(result)
+
+
+@app.get("/tts/audio/{novel_id}/{section}/{seq}")
+def tts_audio(novel_id: int, section: int, seq: int):
+    """Stream the wav for a single unit (synthesised on demand, then cached)."""
+    try:
+        audio = _tts.synthesize_unit(novel_id, section, seq)
+    except Exception as exc:
+        logger.warning("TTS audio failed: %s", exc)
+        raise HTTPException(status_code=502, detail="TTS service error") from exc
+    if audio is None:
+        raise HTTPException(status_code=404, detail="unit not found")
+    return Response(content=audio, media_type="audio/wav")
+
+
+@app.post("/tts/progress")
+def tts_progress(novel_id: int = Query(...), section: int = Query(...)):
+    _tts.save_progress(novel_id, section)
+    return JSONResponse({"status": "ok"})
+
+
 gr.mount_gradio_app(app, build_dashboard_app().queue(default_concurrency_limit=4), path="/dashboard", css=CSS, js=THEME_JS, theme=gr.themes.Base())
 gr.mount_gradio_app(app, build_reader_app().queue(default_concurrency_limit=4), path="/reader", css=READER_CSS, js=READER_JS, theme=gr.themes.Base())
 
