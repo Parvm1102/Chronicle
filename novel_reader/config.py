@@ -19,6 +19,10 @@ TTS_SERVICE_URL = os.environ.get("TTS_SERVICE_URL", "http://localhost:8070")
 TTS_CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", str(DATA_DIR / "tts_cache")))
 # Fallback voice actor for narration when no narrator character/actor is assigned.
 TTS_DEFAULT_NARRATOR_ACTOR = os.environ.get("TTS_DEFAULT_NARRATOR_ACTOR", "Sohee")
+# How many upcoming units to keep synthesized ahead of the playback head.
+# Prefetch is a sliding window: only this many lines past where the engine
+# currently is are generated (spilling into the next section near the end).
+TTS_LOOKAHEAD = int(os.environ.get("TTS_LOOKAHEAD", "4"))
 
 
 def ensure_app_dirs() -> None:

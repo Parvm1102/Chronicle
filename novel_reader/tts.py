@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import TTS_DEFAULT_NARRATOR_ACTOR, TTS_SERVICE_URL
+from .config import TTS_DEFAULT_NARRATOR_ACTOR, TTS_LOOKAHEAD, TTS_SERVICE_URL
 from .storage import LibraryStore
 
 logger = logging.getLogger(__name__)
@@ -72,8 +72,12 @@ class TTSOrchestrator:
     def __init__(self, store: Optional[LibraryStore] = None) -> None:
         self._store = store or LibraryStore()
         self._client = TTSClient()
+        # A couple of background workers so prefetch runs parallel to the UI and
+        # to playback. (The TTS engine itself serialises on the GPU, so a wide
+        # pool buys nothing — the win is overlapping prefetch with playback.)
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts-prefetch")
         self._lock = threading.Lock()
+        self._lookahead = max(1, TTS_LOOKAHEAD)
 
         # Lazily-initialised parser-side helpers (PostgreSQL + voice samples).
         self._db: Any = None
@@ -224,30 +228,67 @@ class TTSOrchestrator:
 
     # ── prefetch + audio ────────────────────────────────────────────────────
 
-    def prefetch(self, novel_id: int, section_index: int) -> None:
-        """Warm the TTS cache for this section (and the next) in the background."""
-        for sec in (section_index, section_index + 1):
-            self._pool.submit(self._prefetch_section, novel_id, sec)
+    def prefetch_window(
+        self,
+        novel_id: int,
+        section_index: int,
+        start_seq: Optional[int] = None,
+        lookahead: Optional[int] = None,
+    ) -> None:
+        """Warm a *bounded* window of upcoming units in the background.
 
-    def _prefetch_section(self, novel_id: int, section_index: int) -> None:
+        Only ``lookahead`` units at/after ``start_seq`` are synthesized — a
+        sliding window that tracks the playback head rather than the whole
+        chapter. When the window runs past the end of the section it spills into
+        the next section's first units so chapter transitions stay seamless.
+
+        Called once when the user presses play (``start_seq=None`` → from the
+        top) and again each time the player advances a line (``start_seq`` = the
+        line now playing), which slides the window forward.
+        """
+        n = max(1, lookahead or self._lookahead)
+        self._pool.submit(self._prefetch_window, novel_id, section_index, start_seq, n)
+
+    def _prefetch_window(
+        self, novel_id: int, section_index: int, start_seq: Optional[int], lookahead: int
+    ) -> None:
         try:
             playlist = self.build_playlist(novel_id, section_index)
             if playlist.get("status") != "ready":
                 return
-            for unit in playlist["units"]:
-                key = (novel_id, section_index, unit["seq"])
-                with self._lock:
-                    if key in self._prefetched:
-                        continue
-                    self._prefetched.add(key)
-                try:
-                    self._client.synthesize(unit["text"], unit["voice_ref"])
-                except Exception as exc:
-                    logger.debug("Prefetch failed (seq=%s): %s", unit["seq"], exc)
-                    with self._lock:
-                        self._prefetched.discard(key)
+            units = playlist["units"]
+            if start_seq is None:
+                start_idx = 0
+            else:
+                start_idx = next(
+                    (i for i, u in enumerate(units) if u["seq"] >= start_seq), len(units)
+                )
+            window = units[start_idx : start_idx + lookahead]
+            self._synthesize_units(novel_id, section_index, window)
+
+            # Spill remaining budget into the next section near a chapter boundary.
+            remaining = lookahead - len(window)
+            if remaining > 0:
+                nxt = self.build_playlist(novel_id, section_index + 1)
+                if nxt.get("status") == "ready":
+                    self._synthesize_units(novel_id, section_index + 1, nxt["units"][:remaining])
         except Exception as exc:
-            logger.debug("Prefetch section %s failed: %s", section_index, exc)
+            logger.debug("Prefetch window (sec=%s, seq=%s) failed: %s", section_index, start_seq, exc)
+
+    def _synthesize_units(self, novel_id: int, section_index: int, units: list[dict]) -> None:
+        """Synthesize a list of units, skipping ones already cached/in-flight."""
+        for unit in units:
+            key = (novel_id, section_index, unit["seq"])
+            with self._lock:
+                if key in self._prefetched:
+                    continue
+                self._prefetched.add(key)
+            try:
+                self._client.synthesize(unit["text"], unit["voice_ref"])
+            except Exception as exc:
+                logger.debug("Prefetch synth failed (seq=%s): %s", unit["seq"], exc)
+                with self._lock:
+                    self._prefetched.discard(key)  # allow a later retry
 
     def synthesize_unit(self, novel_id: int, section_index: int, seq: int) -> Optional[bytes]:
         """Return wav bytes for a single unit, generating on demand if needed."""

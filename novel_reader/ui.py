@@ -885,6 +885,9 @@ function ttsPlayIdx(i) {
   const el = document.getElementById(`tts-u-${unit.seq}`);
   if (el) { el.classList.add("tts-active"); el.scrollIntoView({ behavior: "smooth", block: "center" }); }
 
+  // Slide the server-side prefetch window forward to track the playback head.
+  fetch(`/tts/prefetch?novel_id=${s.novelId}&section=${s.section}&seq=${unit.seq}`).catch(() => {});
+
   let audio = (s.nextAudio && s.nextAudio.__url === unit.audio_url) ? s.nextAudio : new Audio(unit.audio_url);
   audio.__url = unit.audio_url;
   s.audio = audio;

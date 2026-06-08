@@ -105,8 +105,18 @@ def tts_playlist(novel_id: int = Query(...), section: int = Query(...)):
     """Return the ordered, speakable units for a chapter and warm the cache."""
     result = _tts.build_playlist(novel_id, section)
     if result.get("status") == "ready":
-        _tts.prefetch(novel_id, section)
+        # Warm only the first window; the player slides it forward via /tts/prefetch.
+        _tts.prefetch_window(novel_id, section, start_seq=None)
     return JSONResponse(result)
+
+
+@app.get("/tts/prefetch")
+def tts_prefetch(
+    novel_id: int = Query(...), section: int = Query(...), seq: int = Query(...)
+):
+    """Slide the prefetch window forward to track the current playback line."""
+    _tts.prefetch_window(novel_id, section, start_seq=seq)
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/tts/audio/{novel_id}/{section}/{seq}")

@@ -196,7 +196,9 @@ python app.py                          # main app
    start narration:
    - reading begins at your current chapter and **auto-advances** to the next,
    - the **current line is highlighted** and the page **auto-scrolls**,
-   - upcoming lines (and the next chapter) are **prefetched** for near real-time playback,
+   - upcoming lines are **prefetched** in a sliding window that tracks the
+     playback head (spilling into the next chapter near a boundary) for near
+     real-time playback — tune the depth with `TTS_LOOKAHEAD` (default `4`),
    - click the icon again to stop.
 5. If a chapter isn't parsed yet, a small **"Parsing in progress…"** toast
    appears and fades after a few seconds.
