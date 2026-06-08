@@ -107,7 +107,13 @@ class LLMClient:
         last_exc: Exception | None = None
         for attempt in range(1, 4):
             try:
-                raw_dict = self.chat_json(messages, max_tokens=max_tokens, timeout=timeout)
+                raw = self.chat(
+                    messages,
+                    json_mode=True,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+                raw_dict = self._parse_json(raw)
                 return response_model.model_validate(raw_dict)
             except (ValueError, Exception) as exc:
                 last_exc = exc
@@ -126,10 +132,13 @@ class LLMClient:
         json_mode: bool,
         max_tokens: int | None,
     ) -> dict[str, Any]:
+        if json_mode and self._provider == LLMProvider.OLLAMA:
+            messages = self._with_no_think(messages)
+
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "temperature": self._temperature,
+            "temperature": 0.0 if json_mode else self._temperature,
         }
         # Use a generous default of 4096 to prevent response truncation in Ollama / cloud providers
         kwargs["max_tokens"] = max_tokens if max_tokens is not None else 4096
@@ -143,9 +152,11 @@ class LLMClient:
         if self._provider == LLMProvider.OLLAMA:
             # Ollama expects options like num_ctx in extra_body when using the OpenAI-compatible endpoint
             kwargs["extra_body"] = {
+                "think": False,
                 "options": {
                     "num_ctx": self._settings.llm_max_context,
-                    "num_predict": max_tokens if max_tokens is not None else 4096
+                    "num_predict": max_tokens if max_tokens is not None else 4096,
+                    "temperature": 0.0 if json_mode else self._temperature,
                 }
             }
             # Disable thinking for Ollama models to prevent conflicts with JSON mode and slowdowns.
@@ -193,10 +204,9 @@ class LLMClient:
         # Handle unclosed thinking blocks at the start of the text
         text = re.sub(r"^<(think|thought|reasoning|thought_process)>[^{]*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        # Discard anything before the first '{' to strip unclosed thought process or preamble text
-        start_brace = text.find("{")
-        if start_brace != -1:
-            text = text[start_brace:]
+        extracted = LLMClient._extract_first_json_object(text)
+        if extracted is not None:
+            return extracted
 
         # Try to locate the JSON boundaries using brace matching
         start = text.find("{")
@@ -236,6 +246,55 @@ class LLMClient:
             except Exception:
                 logger.error("Failed to parse LLM JSON output: %s\nRaw: %s", exc, raw[:500])
                 raise ValueError(f"LLM returned invalid JSON: {exc}") from exc
+
+    @staticmethod
+    def _with_no_think(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Add Qwen/Ollama no-thinking hint to JSON calls without mutating caller data."""
+        if not messages:
+            return messages
+
+        copied = [dict(message) for message in messages]
+        last = copied[-1]
+        content = last.get("content", "")
+        if "/no_think" not in content:
+            last["content"] = f"/no_think\n\n{content}"
+        return copied
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+        """Find and parse the first balanced JSON object embedded in text."""
+        starts = [idx for idx, char in enumerate(text) if char == "{"]
+        for start in starts:
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx in range(start, len(text)):
+                char = text[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:idx + 1]
+                        try:
+                            parsed = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+                        if isinstance(parsed, dict):
+                            return parsed
+                        break
+        return None
 
     @staticmethod
     def _repair_json(json_str: str) -> str:

@@ -46,12 +46,18 @@ CHATTERBOX_TAGS = [
 _ANALYSIS_SYSTEM = """\
 You are an expert audiobook producer analysing novel text for TTS production.
 You must identify speakers, emotions, and inject Chatterbox TTS tags.
-Respond ONLY with valid JSON matching the schema below. Do NOT output any preamble, markdown code blocks, XML tags, conversational intro/outro, or thinking/reasoning thoughts. Start your response directly with the opening brace '{'.
+Respond ONLY with valid JSON matching the schema below. Do NOT output any preamble, markdown code blocks, XML tags, conversational intro/outro, <think>, <thought>, chain-of-thought, analysis, or reasoning notes. Start your response directly with the opening brace '{'.
 """
 
 _ANALYSIS_USER = """\
+/no_think
+
 KNOWN CHARACTERS (use these exact names for speaker identification):
 {characters_json}
+
+If one known character has "is_narrator": true, "NARRATOR" entries are voiced by\
+ that character. Still use "NARRATOR" for narration entries; the parser resolves\
+ it to the narrator character.
 
 PRECEDING TEXT (context only — do NOT analyse):
 {prev_chunk_text}
@@ -115,6 +121,7 @@ EVENTS — if a significant plot event occurs, include in "events":
 - spoiler_level: 0-10
 
 Respond ONLY with valid JSON. Do NOT think out loud, write markdown lists, or output reasoning before outputting the JSON. Start your response immediately with the opening curly brace '{{' of the JSON:
+Do not include <think>, <thought>, markdown, notes, bullets, or analysis.
 {{
   "entries": [
     {{"entry_type": "...", "speaker": "...", "emotion": "...", "emotion_intensity": "...",\
@@ -158,9 +165,12 @@ class DialogueAnalyzer:
         total = len(sections)
         logger.info("Pass 2: starting dialogue analysis for %d sections with concurrency %d", total, self._concurrency)
 
+        narrator_character_id = self._db.get_narrator_character_id(novel_meta_id)
+        characters = self._apply_narrator_flag(characters, narrator_character_id)
+
         # Build character reference for prompts
         char_prompt_data = self._build_char_prompt_data(characters)
-        char_name_to_id = self._build_name_map(characters)
+        speaker_lookup = self._build_speaker_lookup(characters)
 
         # Get the set of already completed section indices in the database
         completed_sections = self._db.get_completed_dialogue_sections(novel_meta_id)
@@ -226,7 +236,7 @@ class DialogueAnalyzer:
                         section,
                         start_seq,
                         char_prompt_data,
-                        char_name_to_id,
+                        speaker_lookup,
                         total,
                         sections,
                         completed_sections_lock,
@@ -258,7 +268,7 @@ class DialogueAnalyzer:
         section: dict[str, Any],
         start_seq: int,
         char_prompt_data: str,
-        char_name_to_id: dict[str, int],
+        speaker_lookup: dict[str, tuple[int | None, str]],
         total: int,
         sections: list[dict[str, Any]],
         completed_sections_lock: threading.Lock,
@@ -296,6 +306,19 @@ class DialogueAnalyzer:
 
         for chunk_idx, chunk_blocks in enumerate(chunks):
             chunk_text = self._format_chunk(chunk_blocks)
+            logger.info(
+                "Pass 2: section %d/%d chunk %d/%d (%d blocks, %d chars)",
+                sec_idx + 1, total, chunk_idx + 1, len(chunks),
+                len(chunk_blocks), len(chunk_text),
+            )
+            self._db.set_parse_status(
+                novel_meta_id,
+                "pass2_running",
+                (
+                    f"Analysing dialogue: section {sec_idx + 1}/{total}, "
+                    f"chunk {chunk_idx + 1}/{len(chunks)}"
+                ),
+            )
 
             # Lookahead: next chunk's text
             lookahead = ""
@@ -309,6 +332,29 @@ class DialogueAnalyzer:
                     if next_blocks:
                         lookahead = self._format_chunk(next_blocks[:3])
 
+            if self._is_deterministic_chunk(chunk_blocks):
+                for block in chunk_blocks:
+                    speaker_id, speaker_name = self._resolve_speaker(
+                        None, block.block_type, speaker_lookup
+                    )
+                    dialogue_inserts.append({
+                        "entry_type": block.block_type,
+                        "raw_text": block.text,
+                        "original_text": block.text,
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker_name,
+                        "emotion": "neutral",
+                        "emotion_intensity": "low",
+                        "associated_characters": [],
+                        "context_before": "\n".join(history[-2:]) if history else "",
+                        "context_after": lookahead[:200] if lookahead else "",
+                        "llm_confidence": 1.0,
+                        "sequence_number": local_seq,
+                    })
+                    local_seq += 1
+                prev_chunk_text = chunk_text
+                continue
+
             # Call LLM
             try:
                 result = self._analyse_chunk(
@@ -320,14 +366,17 @@ class DialogueAnalyzer:
                     "Pass 2 LLM error on section %d chunk %d: %s",
                     sec_idx + 1, chunk_idx + 1, exc,
                 )
-                # Store blocks as-is with unknown speaker
+                # Store blocks as-is with deterministic fallback speakers.
                 for block in chunk_blocks:
+                    speaker_id, speaker_name = self._resolve_speaker(
+                        None, block.block_type, speaker_lookup
+                    )
                     dialogue_inserts.append({
                         "entry_type": block.block_type,
                         "raw_text": block.text,
                         "original_text": block.text,
-                        "speaker_id": char_name_to_id.get("UNKNOWN"),
-                        "speaker_name": "UNKNOWN",
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker_name,
                         "emotion": "neutral",
                         "emotion_intensity": "low",
                         "associated_characters": [],
@@ -369,18 +418,17 @@ class DialogueAnalyzer:
                 if best_entry and best_score > 0.3:
                     unmatched_entries.remove(best_entry)
 
-                    speaker_name = best_entry.speaker or ("NARRATOR" if block.block_type == "narration" else "UNKNOWN")
-                    speaker_id = char_name_to_id.get(speaker_name)
+                    speaker_id, speaker_name = self._resolve_speaker(
+                        best_entry.speaker, block.block_type, speaker_lookup
+                    )
 
                     emotion, intensity = resolve_emotion_intensity(
                         best_entry.emotion, best_entry.emotion_intensity
                     )
 
-                    assoc_ids = [
-                        char_name_to_id[n]
-                        for n in (best_entry.associated_characters or [])
-                        if n in char_name_to_id
-                    ]
+                    assoc_ids = self._resolve_character_ids(
+                        best_entry.associated_characters or [], speaker_lookup
+                    )
 
                     raw_text = block.text
                     entry_raw = best_entry.raw_text or ""
@@ -415,8 +463,9 @@ class DialogueAnalyzer:
                         history = history[-self._history_size:]
 
                 else:
-                    speaker_name = "NARRATOR" if block.block_type == "narration" else "UNKNOWN"
-                    speaker_id = char_name_to_id.get(speaker_name)
+                    speaker_id, speaker_name = self._resolve_speaker(
+                        None, block.block_type, speaker_lookup
+                    )
 
                     dialogue_inserts.append({
                         "entry_type": block.block_type,
@@ -437,7 +486,8 @@ class DialogueAnalyzer:
 
             # Store profile updates
             for update in result.profile_updates:
-                char_id = char_name_to_id.get(update.character_name)
+                resolved_update_char = self._resolve_character(update.character_name, speaker_lookup)
+                char_id = resolved_update_char[0] if resolved_update_char else None
                 if char_id:
                     profile_inserts.append({
                         "character_id": char_id,
@@ -451,16 +501,12 @@ class DialogueAnalyzer:
 
             # Store events
             for evt_idx, event in enumerate(result.events):
-                involved_ids = [
-                    char_name_to_id[n]
-                    for n in event.characters_involved
-                    if n in char_name_to_id
-                ]
-                speaker_ids = [
-                    char_name_to_id[n]
-                    for n in event.speakers
-                    if n in char_name_to_id
-                ]
+                involved_ids = self._resolve_character_ids(
+                    event.characters_involved, speaker_lookup
+                )
+                speaker_ids = self._resolve_character_ids(
+                    event.speakers, speaker_lookup
+                )
                 event_inserts.append({
                     "sequence_number": local_seq + evt_idx,
                     "event_type": event.event_type,
@@ -561,6 +607,7 @@ class DialogueAnalyzer:
                 {"role": "user", "content": user_msg},
             ],
             response_model=ChunkAnalysisResult,
+            max_tokens=4096,
         )
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -586,25 +633,93 @@ class DialogueAnalyzer:
         return json.dumps(chars, indent=2)
 
     @staticmethod
-    def _build_name_map(characters: list[dict[str, Any]]) -> dict[str, int]:
-        """Build a name/alias → character_id lookup."""
-        name_map: dict[str, int] = {}
+    def _apply_narrator_flag(
+        characters: list[dict[str, Any]],
+        narrator_character_id: int | None,
+    ) -> list[dict[str, Any]]:
+        """Merge novels_meta narrator info into character rows used by Pass 2."""
+        if narrator_character_id is None:
+            return characters
+
+        flagged: list[dict[str, Any]] = []
+        for c in characters:
+            row = dict(c)
+            if row.get("id") == narrator_character_id:
+                row["is_narrator"] = True
+            flagged.append(row)
+        return flagged
+
+    @staticmethod
+    def _build_speaker_lookup(characters: list[dict[str, Any]]) -> dict[str, tuple[int | None, str]]:
+        """Build a name/alias to (character_id, canonical speaker name) lookup."""
+        name_map: dict[str, tuple[int | None, str]] = {}
+
+        def add(key: str, char_id: int | None, canonical: str) -> None:
+            key = key.strip()
+            if not key:
+                return
+            name_map[key] = (char_id, canonical)
+            name_map[key.lower()] = (char_id, canonical)
+
         for c in characters:
             char_id = c["id"]
-            name_map[c["name"]] = char_id
-            name_map[c["name"].lower()] = char_id
+            canonical = c["name"]
+            add(canonical, char_id, canonical)
             for alias in c.get("aliases", []):
-                name_map[alias] = char_id
-                name_map[alias.lower()] = char_id
-        # Always map NARRATOR
+                add(alias, char_id, canonical)
+
+        # Always map NARRATOR to the narrator character when one exists.
         narrator_chars = [c for c in characters if c.get("is_narrator")]
         if narrator_chars:
-            name_map["NARRATOR"] = narrator_chars[0]["id"]
+            narrator = narrator_chars[0]
+            add("NARRATOR", narrator["id"], narrator["name"])
+
         # Always map MISC_VOICE
         misc_chars = [c for c in characters if c.get("role") == "misc_voice"]
         if misc_chars:
-            name_map["MISC_VOICE"] = misc_chars[0]["id"]
+            misc = misc_chars[0]
+            add("MISC_VOICE", misc["id"], misc["name"])
+
+        add("UNKNOWN", None, "UNKNOWN")
         return name_map
+
+    @staticmethod
+    def _resolve_speaker(
+        speaker: str | None,
+        block_type: str,
+        speaker_lookup: dict[str, tuple[int | None, str]],
+    ) -> tuple[int | None, str]:
+        """Resolve an LLM speaker label to a canonical DB speaker."""
+        fallback = "NARRATOR" if block_type in {"narration", "thought", "action"} else "UNKNOWN"
+        label = (speaker or fallback).strip() or fallback
+        return DialogueAnalyzer._resolve_character(label, speaker_lookup) or speaker_lookup["UNKNOWN"]
+
+    @staticmethod
+    def _resolve_character(
+        label: str | None,
+        speaker_lookup: dict[str, tuple[int | None, str]],
+    ) -> tuple[int | None, str] | None:
+        if not label:
+            return None
+        label = label.strip()
+        return speaker_lookup.get(label) or speaker_lookup.get(label.lower())
+
+    @staticmethod
+    def _resolve_character_ids(
+        labels: list[str],
+        speaker_lookup: dict[str, tuple[int | None, str]],
+    ) -> list[int]:
+        ids: list[int] = []
+        for label in labels:
+            resolved = DialogueAnalyzer._resolve_character(label, speaker_lookup)
+            if resolved and resolved[0] is not None and resolved[0] not in ids:
+                ids.append(resolved[0])
+        return ids
+
+    @staticmethod
+    def _is_deterministic_chunk(blocks: list[TextBlock]) -> bool:
+        """Chunks with no dialogue do not need LLM speaker attribution."""
+        return bool(blocks) and all(block.block_type != "dialogue" for block in blocks)
 
     @staticmethod
     def _format_chunk(blocks: list[TextBlock]) -> str:
@@ -612,7 +727,7 @@ class DialogueAnalyzer:
         lines = []
         for block in blocks:
             if block.block_type == "dialogue":
-                lines.append(f'"{ block.text}"')
+                lines.append(f'"{block.text}"')
             elif block.block_type == "thought":
                 lines.append(f"*{block.text}*")
             elif block.block_type == "action":

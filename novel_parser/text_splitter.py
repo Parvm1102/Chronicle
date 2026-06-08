@@ -8,8 +8,7 @@ and sequence numbering are straightforward.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass
@@ -25,16 +24,21 @@ class TextBlock:
 # Patterns
 # ───────────────────────────────────────────────────────────────────────────
 
-# Matches text within double quotes, single quotes, or guillemets
+# Matches text within double quotes, single quotes, smart quotes, or guillemets.
 _DIALOGUE_RE = re.compile(
     r'("(?:[^"\\]|\\.)*"'           # "double quoted"
-    r"|'(?:[^'\\]|\\.)*'"           # 'single quoted'  (smart quotes)
+    r"|'(?:[^'\\]|\\.)*'"           # 'single quoted'
+    r"|\u201c[^\u201d]*\u201d"      # “smart double quoted”
     r"|«[^»]*»"                     # «guillemets»
-    r'|"[^"\u201d]*[\u201d"]'       # "smart double quotes"
+    r'|"[^"\u201d]*[\u201d"]'       # "mixed smart double close”
     r"|\u2018[^\u2019]*\u2019"      # 'smart single quotes'
     r")",
     re.DOTALL,
 )
+
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_MAX_BLOCK_CHARS = 1400
+_MAX_CHUNK_CHARS = 3200
 
 # Italicised text often indicates inner thoughts
 _THOUGHT_RE = re.compile(
@@ -89,8 +93,10 @@ class TextSplitter:
             # Split paragraph into dialogue / non-dialogue spans
             para_blocks = self._split_dialogue(para, para_idx, block_idx)
             for b in para_blocks:
-                blocks.append(b)
-                block_idx += 1
+                for part in self._split_long_block(b, _MAX_BLOCK_CHARS):
+                    part.index = block_idx
+                    blocks.append(part)
+                    block_idx += 1
 
         return blocks
 
@@ -98,11 +104,12 @@ class TextSplitter:
         self,
         blocks: list[TextBlock],
         max_blocks_per_chunk: int = 6,
+        max_chars_per_chunk: int = _MAX_CHUNK_CHARS,
     ) -> list[list[TextBlock]]:
         """Group blocks into chunks for LLM processing.
 
         Tries to keep paragraph boundaries together; falls back to
-        *max_blocks_per_chunk* as the hard limit.
+        *max_blocks_per_chunk* and *max_chars_per_chunk* as hard limits.
         """
         if not blocks:
             return []
@@ -111,6 +118,7 @@ class TextSplitter:
         current_chunk: list[TextBlock] = []
         current_para = blocks[0].paragraph_index if blocks else 0
         para_count = 0
+        current_chars = 0
 
         for block in blocks:
             # New paragraph?
@@ -119,12 +127,19 @@ class TextSplitter:
                 current_para = block.paragraph_index
 
             # Start new chunk after ~2 paragraphs or max blocks
-            if (para_count >= 2 or len(current_chunk) >= max_blocks_per_chunk) and current_chunk:
+            next_size = current_chars + len(block.text) + (2 if current_chunk else 0)
+            if (
+                para_count >= 2
+                or len(current_chunk) >= max_blocks_per_chunk
+                or next_size > max_chars_per_chunk
+            ) and current_chunk:
                 chunks.append(current_chunk)
                 current_chunk = []
                 para_count = 0
+                current_chars = 0
 
             current_chunk.append(block)
+            current_chars += len(block.text) + (2 if len(current_chunk) > 1 else 0)
 
         if current_chunk:
             chunks.append(current_chunk)
@@ -213,6 +228,81 @@ class TextSplitter:
             ))
 
         return blocks
+
+    @staticmethod
+    def _split_long_block(block: TextBlock, max_chars: int) -> list[TextBlock]:
+        """Split oversized narration/dialogue blocks so one paragraph cannot dominate a prompt."""
+        if len(block.text) <= max_chars:
+            return [block]
+
+        parts: list[str] = []
+        current = ""
+
+        for sentence in _SENTENCE_BOUNDARY_RE.split(block.text):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            if len(sentence) > max_chars:
+                if current:
+                    parts.append(current)
+                    current = ""
+                parts.extend(TextSplitter._split_long_piece(sentence, max_chars))
+                continue
+
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate) > max_chars:
+                if current:
+                    parts.append(current)
+                current = sentence
+            else:
+                current = candidate
+
+        if current:
+            parts.append(current)
+
+        return [
+            TextBlock(
+                index=block.index,
+                text=part,
+                block_type=block.block_type,
+                paragraph_index=block.paragraph_index,
+            )
+            for part in parts
+        ] or [block]
+
+    @staticmethod
+    def _split_long_piece(text: str, max_chars: int) -> list[str]:
+        """Split text with no sentence boundaries at whitespace near max_chars."""
+        words = text.split()
+        if not words:
+            return [text[:max_chars]]
+
+        parts: list[str] = []
+        current: list[str] = []
+        current_len = 0
+
+        for word in words:
+            if len(word) > max_chars:
+                if current:
+                    parts.append(" ".join(current))
+                    current = []
+                    current_len = 0
+                parts.extend(word[i:i + max_chars] for i in range(0, len(word), max_chars))
+                continue
+
+            extra = len(word) + (1 if current else 0)
+            if current and current_len + extra > max_chars:
+                parts.append(" ".join(current))
+                current = [word]
+                current_len = len(word)
+            else:
+                current.append(word)
+                current_len += extra
+
+        if current:
+            parts.append(" ".join(current))
+        return parts
 
     @staticmethod
     def blocks_to_text(blocks: list[TextBlock]) -> str:

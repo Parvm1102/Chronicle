@@ -289,6 +289,17 @@ class DatabaseManager:
                 (novel_uuid,),
             ).fetchone()
 
+    def get_narrator_character_id(self, novel_meta_id: int) -> Optional[int]:
+        """Return the narrator character id recorded on novels_meta, if any."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT narrator_character_id FROM novels_meta WHERE id = %s",
+                (novel_meta_id,),
+            ).fetchone()
+            if not row or row["narrator_character_id"] is None:
+                return None
+            return int(row["narrator_character_id"])
+
     def delete_novel_meta(self, novel_uuid: str) -> None:
         """Delete a novel's metadata and all parsed data from PostgreSQL.
 
