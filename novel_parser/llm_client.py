@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Optional, Type
+from typing import Any, Callable, Optional, Type, TypeVar
 
 from openai import OpenAI
 from pydantic import BaseModel
@@ -20,6 +20,8 @@ from pydantic import BaseModel
 from .config import LLMProvider, Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class LLMClient:
@@ -66,7 +68,10 @@ class LLMClient:
             The assistant message content as a string.
         """
         kwargs = self._build_kwargs(messages, json_mode, max_tokens)
-        return self._call_with_retry(kwargs, timeout=timeout)
+        return self._retry(
+            lambda: self._call_once(kwargs, timeout),
+            what="LLM call",
+        )
 
     def chat_json(
         self,
@@ -75,21 +80,22 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Chat completion with JSON output, parsed into a dict, retrying on parse errors."""
-        import time
-        last_exc: Exception | None = None
-        for attempt in range(1, 4):
+        """Chat completion with JSON output, parsed into a dict."""
+        current_messages = [dict(message) for message in messages]
+
+        def _call_json() -> dict[str, Any]:
+            nonlocal current_messages
+            kwargs = self._build_kwargs(current_messages, True, max_tokens)
             try:
-                raw = self.chat(messages, json_mode=True, max_tokens=max_tokens, timeout=timeout)
-                return self._parse_json(raw)
-            except ValueError as exc:
-                last_exc = exc
-                logger.warning(
-                    "JSON parsing failed on attempt %d/3: %s. Retrying...",
-                    attempt, exc
-                )
-                time.sleep(1)
-        raise last_exc or ValueError("Failed to obtain valid JSON after 3 attempts")
+                return self._parse_json(self._call_once(kwargs, timeout))
+            except Exception:
+                current_messages = self._with_json_retry_instruction(messages)
+                raise
+
+        return self._retry(
+            _call_json,
+            what="JSON response",
+        )
 
     def chat_structured(
         self,
@@ -99,30 +105,24 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> BaseModel:
-        """Chat completion parsed into a Pydantic model.
+        """Chat completion parsed and validated into a Pydantic model."""
+        current_messages = [dict(message) for message in messages]
 
-        Sends in JSON mode and validates the response against *response_model*, retrying on errors.
-        """
-        import time
-        last_exc: Exception | None = None
-        for attempt in range(1, 4):
+        def _call_structured() -> BaseModel:
+            nonlocal current_messages
+            kwargs = self._build_kwargs(current_messages, True, max_tokens)
             try:
-                raw = self.chat(
-                    messages,
-                    json_mode=True,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
+                return response_model.model_validate(
+                    self._parse_json(self._call_once(kwargs, timeout))
                 )
-                raw_dict = self._parse_json(raw)
-                return response_model.model_validate(raw_dict)
-            except (ValueError, Exception) as exc:
-                last_exc = exc
-                logger.warning(
-                    "Structured validation failed on attempt %d/3: %s. Retrying...",
-                    attempt, exc
-                )
-                time.sleep(1)
-        raise last_exc or ValueError("Failed to obtain valid structured response after 3 attempts")
+            except Exception:
+                current_messages = self._with_json_retry_instruction(messages)
+                raise
+
+        return self._retry(
+            _call_structured,
+            what="structured response",
+        )
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ class LLMClient:
         json_mode: bool,
         max_tokens: int | None,
     ) -> dict[str, Any]:
-        if json_mode and self._provider == LLMProvider.OLLAMA:
+        if json_mode and (self._provider == LLMProvider.OLLAMA or "qwen" in self._model.lower()):
             messages = self._with_no_think(messages)
 
         kwargs: dict[str, Any] = {
@@ -164,33 +164,37 @@ class LLMClient:
 
         return kwargs
 
-    def _call_with_retry(self, kwargs: dict[str, Any], timeout: float | None = None) -> str:
+    def _call_once(self, kwargs: dict[str, Any], timeout: float | None = None) -> str:
+        """Make a single chat-completion API call and return the message content."""
+        call_kwargs = dict(kwargs)
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+        response = self._client.chat.completions.create(**call_kwargs)
+        content = response.choices[0].message.content or ""
+        logger.debug("LLM response length: %d chars", len(content))
+        return content
+
+    def _retry(self, fn: Callable[[], T], *, what: str) -> T:
+        """Run *fn* with exponential back-off.
+
+        A single retry layer covering transient API errors, JSON parsing, and
+        schema validation — so a failure costs at most ``_max_retries`` calls.
+        """
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
-                logger.debug(
-                    "LLM request attempt %d/%d  model=%s",
-                    attempt, self._max_retries, self._model,
-                )
-                call_kwargs = dict(kwargs)
-                if timeout is not None:
-                    call_kwargs["timeout"] = timeout
-                response = self._client.chat.completions.create(**call_kwargs)
-                content = response.choices[0].message.content or ""
-                logger.debug("LLM response length: %d chars", len(content))
-                return content
-
+                return fn()
             except Exception as exc:
                 last_exc = exc
-                wait = min(2 ** attempt, 30)
-                logger.warning(
-                    "LLM call failed (attempt %d/%d): %s — retrying in %ds",
-                    attempt, self._max_retries, exc, wait,
-                )
-                time.sleep(wait)
-
+                if attempt < self._max_retries:
+                    wait = min(2 ** attempt, 30)
+                    logger.warning(
+                        "%s failed (attempt %d/%d): %s — retrying in %ds",
+                        what, attempt, self._max_retries, exc, wait,
+                    )
+                    time.sleep(wait)
         raise RuntimeError(
-            f"LLM call failed after {self._max_retries} attempts: {last_exc}"
+            f"{what} failed after {self._max_retries} attempts: {last_exc}"
         ) from last_exc
 
     @staticmethod
@@ -258,6 +262,23 @@ class LLMClient:
         content = last.get("content", "")
         if "/no_think" not in content:
             last["content"] = f"/no_think\n\n{content}"
+        return copied
+
+    @staticmethod
+    def _with_json_retry_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Add a corrective retry turn after an invalid JSON response."""
+        copied = [dict(message) for message in messages]
+        copied.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response was invalid JSON. Try again and return ONLY "
+                    "one valid JSON object matching the requested schema. Do not include "
+                    "<think>, <thought>, markdown, bullets, notes, analysis, or any text "
+                    "outside the JSON object. Start with '{' and end with '}'."
+                ),
+            }
+        )
         return copied
 
     @staticmethod

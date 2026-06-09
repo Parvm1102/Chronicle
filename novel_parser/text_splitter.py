@@ -24,14 +24,14 @@ class TextBlock:
 # Patterns
 # ───────────────────────────────────────────────────────────────────────────
 
-# Matches text within double quotes, single quotes, smart quotes, or guillemets.
+# Matches text within double quotes, smart double quotes, or guillemets.
+# Single quotes are intentionally NOT treated as dialogue: in English prose they
+# collide with contractions and possessives (don't, it's, the dog's bone).
 _DIALOGUE_RE = re.compile(
     r'("(?:[^"\\]|\\.)*"'           # "double quoted"
-    r"|'(?:[^'\\]|\\.)*'"           # 'single quoted'
     r"|\u201c[^\u201d]*\u201d"      # “smart double quoted”
     r"|«[^»]*»"                     # «guillemets»
     r'|"[^"\u201d]*[\u201d"]'       # "mixed smart double close”
-    r"|\u2018[^\u2019]*\u2019"      # 'smart single quotes'
     r")",
     re.DOTALL,
 )
@@ -53,6 +53,27 @@ _ACTION_RE = re.compile(
     r")",
     re.MULTILINE,
 )
+
+# Section titles that indicate non-story front/back matter.
+_FRONT_MATTER_TITLE_RE = re.compile(
+    r"\b(preface|foreword|author'?s?\s+note|translator'?s?\s+note|"
+    r"dedication|acknowledge?ments?|copyright|about\s+the\s+author|"
+    r"title\s+page|table\s+of\s+contents|colophon|epigraph|"
+    r"publisher'?s?\s+note|introduction)\b",
+    re.IGNORECASE,
+)
+
+
+def is_front_matter(title: str) -> bool:
+    """Return True if a section title indicates non-story front/back matter.
+
+    Front matter (preface, author's note, dedication, etc.) has no characters
+    and must not influence narrator detection. It is still stored and voiced by
+    MISC_VOICE so the reader can play it when on that section.
+    """
+    if not title:
+        return False
+    return bool(_FRONT_MATTER_TITLE_RE.search(title))
 
 
 class TextSplitter:

@@ -153,6 +153,7 @@ class TTSOrchestrator:
         return result
 
     def _build_playlist(self, novel_id: int, section_index: int) -> dict:
+        novel = self._store.get_novel(novel_id)
         if not novel:
             return {"status": "unavailable", "message": "Book not found."}
 
@@ -217,6 +218,7 @@ class TTSOrchestrator:
             units.append(
                 {
                     "seq": seq,
+                    "entry_type": entry.get("entry_type") or "narration",
                     "speaker": entry.get("speaker_name") or "Narrator",
                     "text": text,
                     "voice_ref": voice_ref,

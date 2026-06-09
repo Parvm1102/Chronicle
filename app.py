@@ -62,9 +62,9 @@ def _resume_interrupted_parses() -> None:
                 llm = LLMClient(settings)
                 pipeline = NovelParsingPipeline(db, llm, settings)
 
-                def _run_resume(uuid=novel_uuid, secs=sections, title=novel_title) -> None:
+                def _run_resume(pipe=pipeline, uuid=novel_uuid, secs=sections, title=novel_title) -> None:
                     try:
-                        pipeline.resume(uuid, secs, title)
+                        pipe.resume(uuid, secs, title)
                     except Exception as exc:
                         logger.error("Resume failed for '%s': %s", title, exc)
 

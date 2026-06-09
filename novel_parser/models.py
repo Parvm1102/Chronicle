@@ -159,6 +159,7 @@ class ExtractedCharacter(BaseModel):
 
 class ChapterExtractionResult(BaseModel):
     """LLM output for a single chapter in Pass 1."""
+    is_story_content: bool = True  # False for author notes, afterwords, recaps, glossaries, ads, etc.
     new_characters: list[ExtractedCharacter] = Field(default_factory=list)
     updated_characters: list[ExtractedCharacter] = Field(default_factory=list)
     chapter_summary: str = ""
@@ -167,6 +168,7 @@ class ChapterExtractionResult(BaseModel):
 class Pass1SectionExtraction(BaseModel):
     """One chapter's raw extraction result, persisted for crash-safe resumability."""
     section_index: int
+    is_story_content: bool = True
     new_characters: list[ExtractedCharacter] = Field(default_factory=list)
     updated_characters: list[ExtractedCharacter] = Field(default_factory=list)
     chapter_summary: str = ""

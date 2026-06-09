@@ -25,7 +25,7 @@ from .models import (
     ChunkAnalysisResult,
     resolve_emotion_intensity,
 )
-from .text_splitter import TextBlock, TextSplitter
+from .text_splitter import TextBlock, TextSplitter, is_front_matter
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,8 @@ For EACH text segment (in reading order), provide an entry with:
 - entry_type: "dialogue" | "narration" | "thought" | "action"
 - speaker: character name from the KNOWN CHARACTERS list, or "NARRATOR" for narration,\
  or "MISC_VOICE" for non-character speakers (PA systems, machine voices, TV/radio broadcasts,\
- crowd chants, written signs/letters read aloud)
+ crowd chants, written signs/letters read aloud). If a line is clearly spoken aloud but you\
+ cannot attribute it to any known character, use "MISC_VOICE" (never "NARRATOR").
 - emotion + emotion_intensity: MUST be a valid combination from the list below
 - raw_text: the spoken/narrated text with Chatterbox TTS tags injected where appropriate
 - original_text: the exact source text (unchanged)
@@ -168,6 +169,10 @@ class DialogueAnalyzer:
         narrator_character_id = self._db.get_narrator_character_id(novel_meta_id)
         characters = self._apply_narrator_flag(characters, narrator_character_id)
 
+        # Sections Pass 1 flagged as non-story (author notes, recaps, glossaries,
+        # ads, etc.) are voiced as MISC_VOICE narration instead of being analysed.
+        non_story_sections = self._db.get_non_story_sections(novel_meta_id)
+
         # Build character reference for prompts
         char_prompt_data = self._build_char_prompt_data(characters)
         speaker_lookup = self._build_speaker_lookup(characters)
@@ -240,6 +245,7 @@ class DialogueAnalyzer:
                         total,
                         sections,
                         completed_sections_lock,
+                        non_story_sections,
                     ): sec_idx
                     for sec_idx, section, start_seq in sections_to_process
                 }
@@ -272,6 +278,7 @@ class DialogueAnalyzer:
         total: int,
         sections: list[dict[str, Any]],
         completed_sections_lock: threading.Lock,
+        non_story_sections: set[int],
     ) -> None:
         section_index = section.get("section_index", sec_idx)
         section_title = section.get("title", f"Section {sec_idx + 1}")
@@ -280,6 +287,17 @@ class DialogueAnalyzer:
         logger.info(
             "Pass 2: processing section %d/%d — '%s'", sec_idx + 1, total, section_title
         )
+
+        # Front matter / non-story sections (preface, author's note, recaps,
+        # glossaries, ads, etc.) have no characters. Store them verbatim as
+        # MISC_VOICE narration so they are still read aloud, without an LLM call
+        # or character attribution.
+        if is_front_matter(section_title) or section_index in non_story_sections:
+            self._store_front_matter(
+                novel_meta_id, section_index, section_text, start_seq, speaker_lookup
+            )
+            self._advance_progress(novel_meta_id, total, completed_sections_lock)
+            return
 
         blocks = self._splitter.split(section_text)
         chunks = self._splitter.split_into_chunks(blocks)
@@ -333,24 +351,16 @@ class DialogueAnalyzer:
                         lookahead = self._format_chunk(next_blocks[:3])
 
             if self._is_deterministic_chunk(chunk_blocks):
+                ctx_before = "\n".join(history[-2:]) if history else ""
+                ctx_after = lookahead[:200] if lookahead else ""
                 for block in chunk_blocks:
                     speaker_id, speaker_name = self._resolve_speaker(
                         None, block.block_type, speaker_lookup
                     )
-                    dialogue_inserts.append({
-                        "entry_type": block.block_type,
-                        "raw_text": block.text,
-                        "original_text": block.text,
-                        "speaker_id": speaker_id,
-                        "speaker_name": speaker_name,
-                        "emotion": "neutral",
-                        "emotion_intensity": "low",
-                        "associated_characters": [],
-                        "context_before": "\n".join(history[-2:]) if history else "",
-                        "context_after": lookahead[:200] if lookahead else "",
-                        "llm_confidence": 1.0,
-                        "sequence_number": local_seq,
-                    })
+                    dialogue_inserts.append(self._make_entry(
+                        block, local_seq, speaker_id, speaker_name,
+                        context_before=ctx_before, context_after=ctx_after,
+                    ))
                     local_seq += 1
                 prev_chunk_text = chunk_text
                 continue
@@ -371,20 +381,12 @@ class DialogueAnalyzer:
                     speaker_id, speaker_name = self._resolve_speaker(
                         None, block.block_type, speaker_lookup
                     )
-                    dialogue_inserts.append({
-                        "entry_type": block.block_type,
-                        "raw_text": block.text,
-                        "original_text": block.text,
-                        "speaker_id": speaker_id,
-                        "speaker_name": speaker_name,
-                        "emotion": "neutral",
-                        "emotion_intensity": "low",
-                        "associated_characters": [],
-                        "context_before": "\n".join(history[-2:]) if history else "",
-                        "context_after": lookahead[:200] if lookahead else "",
-                        "llm_confidence": 0.0,
-                        "sequence_number": local_seq,
-                    })
+                    dialogue_inserts.append(self._make_entry(
+                        block, local_seq, speaker_id, speaker_name,
+                        context_before="\n".join(history[-2:]) if history else "",
+                        context_after=lookahead[:200] if lookahead else "",
+                        confidence=0.0,
+                    ))
                     local_seq += 1
                 continue
 
@@ -437,20 +439,15 @@ class DialogueAnalyzer:
                             raw_text = f"{tag} {raw_text}"
                             break
 
-                    dialogue_inserts.append({
-                        "entry_type": block.block_type,
-                        "raw_text": raw_text,
-                        "original_text": block.text,
-                        "speaker_id": speaker_id,
-                        "speaker_name": speaker_name,
-                        "emotion": emotion,
-                        "emotion_intensity": intensity,
-                        "associated_characters": assoc_ids,
-                        "context_before": "\n".join(history[-2:]) if history else "",
-                        "context_after": lookahead[:200] if lookahead else "",
-                        "llm_confidence": best_entry.confidence or 0.5,
-                        "sequence_number": local_seq,
-                    })
+                    dialogue_inserts.append(self._make_entry(
+                        block, local_seq, speaker_id, speaker_name,
+                        raw_text=raw_text,
+                        emotion=emotion, emotion_intensity=intensity,
+                        associated_characters=assoc_ids,
+                        context_before="\n".join(history[-2:]) if history else "",
+                        context_after=lookahead[:200] if lookahead else "",
+                        confidence=best_entry.confidence or 0.5,
+                    ))
 
                     history_line = (
                         f"{speaker_name}: {emotion}_{intensity} — "
@@ -466,21 +463,12 @@ class DialogueAnalyzer:
                     speaker_id, speaker_name = self._resolve_speaker(
                         None, block.block_type, speaker_lookup
                     )
-
-                    dialogue_inserts.append({
-                        "entry_type": block.block_type,
-                        "raw_text": block.text,
-                        "original_text": block.text,
-                        "speaker_id": speaker_id,
-                        "speaker_name": speaker_name,
-                        "emotion": "neutral",
-                        "emotion_intensity": "low",
-                        "associated_characters": [],
-                        "context_before": "\n".join(history[-2:]) if history else "",
-                        "context_after": lookahead[:200] if lookahead else "",
-                        "llm_confidence": 0.0,
-                        "sequence_number": local_seq,
-                    })
+                    dialogue_inserts.append(self._make_entry(
+                        block, local_seq, speaker_id, speaker_name,
+                        context_before="\n".join(history[-2:]) if history else "",
+                        context_after=lookahead[:200] if lookahead else "",
+                        confidence=0.0,
+                    ))
 
                 local_seq += 1
 
@@ -520,6 +508,39 @@ class DialogueAnalyzer:
             prev_chunk_text = chunk_text
 
         # ── Write all data for the section to DB in a single transaction ──
+        self._write_section(
+            novel_meta_id, section_index,
+            dialogue_inserts, profile_inserts, event_inserts,
+        )
+
+        # ── Update progress safely ──
+        self._advance_progress(novel_meta_id, total, completed_sections_lock)
+
+    def _store_front_matter(
+        self,
+        novel_meta_id: int,
+        section_index: int,
+        section_text: str,
+        start_seq: int,
+        speaker_lookup: dict[str, tuple[int | None, str]],
+    ) -> None:
+        """Store a non-story section verbatim, voiced entirely by MISC_VOICE."""
+        misc = speaker_lookup.get("MISC_VOICE") or speaker_lookup["UNKNOWN"]
+        inserts = [
+            self._make_entry(block, start_seq + i, misc[0], misc[1])
+            for i, block in enumerate(self._splitter.split(section_text))
+        ]
+        self._write_section(novel_meta_id, section_index, inserts, [], [])
+
+    def _write_section(
+        self,
+        novel_meta_id: int,
+        section_index: int,
+        dialogue_inserts: list[dict[str, Any]],
+        profile_inserts: list[dict[str, Any]],
+        event_inserts: list[dict[str, Any]],
+    ) -> None:
+        """Persist all buffered entries for one section in a single transaction."""
         with self._db.connection() as conn:
             with conn.transaction():
                 for d in dialogue_inserts:
@@ -567,8 +588,14 @@ class DialogueAnalyzer:
                         conn=conn,
                     )
 
-        # ── Update progress safely ──
-        with completed_sections_lock:
+    def _advance_progress(
+        self,
+        novel_meta_id: int,
+        total: int,
+        lock: threading.Lock,
+    ) -> None:
+        """Mark one more section completed and persist Pass 2 progress."""
+        with lock:
             self._completed_sections += 1
             self._db.upsert_parse_progress(
                 novel_meta_id, pass_number=2,
@@ -689,10 +716,54 @@ class DialogueAnalyzer:
         block_type: str,
         speaker_lookup: dict[str, tuple[int | None, str]],
     ) -> tuple[int | None, str]:
-        """Resolve an LLM speaker label to a canonical DB speaker."""
-        fallback = "NARRATOR" if block_type in {"narration", "thought", "action"} else "UNKNOWN"
-        label = (speaker or fallback).strip() or fallback
-        return DialogueAnalyzer._resolve_character(label, speaker_lookup) or speaker_lookup["UNKNOWN"]
+        """Resolve an LLM speaker label to a canonical DB speaker.
+
+        Narration/thought/action default to NARRATOR. Dialogue whose speaker is
+        missing or unrecognised defaults to MISC_VOICE so stray voices (unknown
+        speakers, machines, broadcasts) are always voiced as non-characters and
+        never merged into the narrator.
+        """
+        is_narration = block_type in {"narration", "thought", "action"}
+        fallback = "NARRATOR" if is_narration else "MISC_VOICE"
+        if speaker and speaker.strip():
+            resolved = DialogueAnalyzer._resolve_character(speaker, speaker_lookup)
+            if resolved:
+                return resolved
+        return (
+            DialogueAnalyzer._resolve_character(fallback, speaker_lookup)
+            or speaker_lookup["UNKNOWN"]
+        )
+
+    @staticmethod
+    def _make_entry(
+        block: TextBlock,
+        seq: int,
+        speaker_id: int | None,
+        speaker_name: str,
+        *,
+        raw_text: str | None = None,
+        emotion: str = "neutral",
+        emotion_intensity: str = "low",
+        associated_characters: list[int] | None = None,
+        context_before: str = "",
+        context_after: str = "",
+        confidence: float = 1.0,
+    ) -> dict[str, Any]:
+        """Build a dialogue_entries insert dict from a block (single source of truth)."""
+        return {
+            "entry_type": block.block_type,
+            "raw_text": raw_text if raw_text is not None else block.text,
+            "original_text": block.text,
+            "speaker_id": speaker_id,
+            "speaker_name": speaker_name,
+            "emotion": emotion,
+            "emotion_intensity": emotion_intensity,
+            "associated_characters": associated_characters or [],
+            "context_before": context_before,
+            "context_after": context_after,
+            "llm_confidence": confidence,
+            "sequence_number": seq,
+        }
 
     @staticmethod
     def _resolve_character(

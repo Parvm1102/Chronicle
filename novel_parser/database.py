@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS novels_meta (
     parse_message TEXT NOT NULL DEFAULT '',
     narrator_type TEXT NOT NULL DEFAULT 'unknown',
     narrator_character_id INTEGER,
+    non_story_sections INTEGER[] NOT NULL DEFAULT '{}',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -228,6 +229,11 @@ class DatabaseManager:
         """Create all tables and indexes if they don't exist."""
         with self.connection() as conn:
             conn.execute(SCHEMA_SQL)
+            # Idempotent migration for pre-existing databases.
+            conn.execute(
+                "ALTER TABLE novels_meta "
+                "ADD COLUMN IF NOT EXISTS non_story_sections INTEGER[] NOT NULL DEFAULT '{}'"
+            )
         logger.info("PostgreSQL schema initialised")
 
     # ── novels_meta CRUD ───────────────────────────────────────────────────
@@ -281,6 +287,36 @@ class DatabaseManager:
         else:
             with self.connection() as c:
                 c.execute(query, params)
+
+    def set_non_story_sections(
+        self,
+        novel_meta_id: int,
+        section_indices: list[int],
+        conn: Optional[psycopg.Connection] = None,
+    ) -> None:
+        """Record which section indices are non-story (front/back matter, recaps, etc.)."""
+        query = """
+                UPDATE novels_meta
+                SET non_story_sections = %s, updated_at = NOW()
+                WHERE id = %s
+                """
+        params = (sorted(set(section_indices)), novel_meta_id)
+        if conn is not None:
+            conn.execute(query, params)
+        else:
+            with self.connection() as c:
+                c.execute(query, params)
+
+    def get_non_story_sections(self, novel_meta_id: int) -> set[int]:
+        """Return the set of section indices flagged as non-story content."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT non_story_sections FROM novels_meta WHERE id = %s",
+                (novel_meta_id,),
+            ).fetchone()
+        if not row or not row["non_story_sections"]:
+            return set()
+        return {int(i) for i in row["non_story_sections"]}
 
     def get_novel_meta(self, novel_uuid: str) -> Optional[dict[str, Any]]:
         with self.connection() as conn:
@@ -337,6 +373,7 @@ class DatabaseManager:
                 UPDATE novels_meta
                 SET parse_status = 'pending', parse_message = '',
                     narrator_type = 'unknown', narrator_character_id = NULL,
+                    non_story_sections = '{}',
                     updated_at = NOW()
                 WHERE id = %s
                 """,
