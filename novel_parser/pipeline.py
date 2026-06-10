@@ -112,6 +112,9 @@ class NovelParsingPipeline:
             self._dialogue_analyzer.run(novel_meta_id, sections, characters)
             logger.info("Pipeline: Pass 2 complete")
 
+            # ── Pass 3 — vector indexing (optional) ───────────────────────
+            self._run_rag_indexing(novel_meta_id, novel_uuid, sections)
+
             self._db.set_parse_status(novel_meta_id, "complete", "Parsing complete")
             logger.info("Pipeline: finished for novel '%s'", novel_title)
 
@@ -121,6 +124,57 @@ class NovelParsingPipeline:
                 novel_meta_id, "error", f"Pipeline failed: {exc}"
             )
             raise
+
+    def _run_rag_indexing(
+        self,
+        novel_meta_id: int,
+        novel_uuid: str,
+        sections: list[dict[str, Any]],
+    ) -> None:
+        """Pass 3 — index the novel into Qdrant (best-effort, never fatal).
+
+        Gated by ENABLE_RAG_INDEXING. Resolves series context so chunks carry a
+        stable ``series_key`` (the first book's uuid) and ``novel_number``.
+        A failure here must not fail the parse — it is logged and swallowed.
+        """
+        try:
+            from novel_rag.config import get_rag_settings
+            from novel_rag.indexer import RagIndexer
+        except ImportError:
+            logger.debug("novel_rag not installed — skipping Pass 3")
+            return
+
+        rag_settings = get_rag_settings()
+        if not rag_settings.enable_rag_indexing:
+            return
+
+        # Series context: standalone defaults to the novel acting as its own series.
+        series_key = novel_uuid
+        series_name = ""
+        novel_number = 1
+        series_info = self._series_mgr.get_series_for_novel(novel_meta_id)
+        if series_info:
+            series_name = series_info.get("name", "")
+            novel_number = int(series_info.get("book_order", 1))
+            books = self._db.get_series_novels(series_info["id"])
+            if books:
+                series_key = books[0].get("novel_uuid", novel_uuid)
+
+        try:
+            self._db.set_parse_status(novel_meta_id, "pass2_running", "Building vector index...")
+            indexer = RagIndexer(rag_settings)
+            count = indexer.run(
+                novel_uuid,
+                sections,
+                series_key=series_key,
+                series_name=series_name,
+                novel_number=novel_number,
+                db=self._db,
+                novel_meta_id=novel_meta_id,
+            )
+            logger.info("Pipeline: Pass 3 indexed %d chunks for %s", count, novel_uuid)
+        except Exception as exc:
+            logger.warning("Pipeline: Pass 3 (RAG indexing) failed for %s: %s", novel_uuid, exc)
 
     def resume(
         self,
@@ -204,6 +258,8 @@ class NovelParsingPipeline:
                 self._dialogue_analyzer.run(novel_meta_id, sections, characters)
                 logger.info("Resume: Pass 2 complete")
 
+                self._run_rag_indexing(novel_meta_id, novel_uuid, sections)
+
                 self._db.set_parse_status(novel_meta_id, "complete", "Parsing complete")
 
             except Exception as exc:
@@ -219,6 +275,7 @@ class NovelParsingPipeline:
         try:
             # DialogueAnalyzer.run() handles section-level resume internally
             self._dialogue_analyzer.run(novel_meta_id, sections, characters)
+            self._run_rag_indexing(novel_meta_id, novel_uuid, sections)
             self._db.set_parse_status(novel_meta_id, "complete", "Parsing complete")
         except Exception as exc:
             self._db.set_parse_status(novel_meta_id, "error", f"Resume failed: {exc}")

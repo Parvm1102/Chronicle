@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -26,10 +27,91 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import TTS_DEFAULT_NARRATOR_ACTOR, TTS_LOOKAHEAD, TTS_SERVICE_URL
+from .config import (
+    TTS_DEFAULT_NARRATOR_ACTOR,
+    TTS_LOOKAHEAD,
+    TTS_MAX_CHARS,
+    TTS_SERVICE_URL,
+)
 from .storage import LibraryStore
 
 logger = logging.getLogger(__name__)
+
+# Each speakable unit's ``seq`` packs the source entry's ``sequence_number`` and
+# the chunk index within that entry: ``seq = sequence_number * _SEQ_STRIDE + i``.
+# This keeps unit seqs globally unique *and* monotonically ordered (so prefetch
+# windows and the audio route still match by seq), while letting the client map
+# a unit back to its source entry via ``seq // _SEQ_STRIDE``. The stride caps the
+# number of chunks one entry may produce; entries never approach this many.
+_SEQ_STRIDE = 1000
+
+# Sentence boundary: end punctuation (incl. closing quotes/brackets) + whitespace.
+_SENTENCE_RE = re.compile(r"(?<=[.!?…])[\"'”’)\]]*\s+")
+# Clause/secondary break points, used only when a single sentence is too long.
+_CLAUSE_RE = re.compile(r"[,;:—–-]")
+
+
+def _split_oversized(text: str, max_len: int) -> list[str]:
+    """Split one over-long sentence into ``<= max_len`` pieces.
+
+    Breaks as late as possible while staying under the limit: prefers the latest
+    clause punctuation (``, ; : — – -``) at/before the boundary, then the latest
+    word boundary. Only hard-cuts when a single word itself exceeds the limit, and
+    even then never mid-word unless unavoidable.
+    """
+    pieces: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_len:
+        window = remaining[:max_len]
+        cut = None
+        # Latest clause break within the limit.
+        for m in _CLAUSE_RE.finditer(window):
+            cut = m.end()
+        if not cut:
+            # Latest word boundary within the limit.
+            ws = window.rfind(" ")
+            cut = ws if ws > 0 else max_len  # single word > limit → hard cut
+        pieces.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        pieces.append(remaining)
+    return [p for p in pieces if p]
+
+
+def _split_text_for_tts(text: str, max_len: int = TTS_MAX_CHARS) -> list[str]:
+    """Split ``text`` into speakable chunks each ``<= max_len`` characters.
+
+    Greedy packing: whole sentences are accumulated into a chunk until the next
+    one would exceed ``max_len``, minimizing the number of breaks. A single
+    sentence longer than ``max_len`` is split via :func:`_split_oversized`.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+
+    sentences = [s for s in (p.strip() for p in _SENTENCE_RE.split(text)) if s] or [text]
+
+    chunks: list[str] = []
+    buf = ""
+    for sentence in sentences:
+        if len(sentence) > max_len:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.extend(_split_oversized(sentence, max_len))
+            continue
+        candidate = f"{buf} {sentence}" if buf else sentence
+        if len(candidate) <= max_len:
+            buf = candidate
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = sentence
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 # Default Turbo sampling params (kept here so the audio + prefetch paths agree,
 # which keeps the service-side cache keys identical).
@@ -214,17 +296,28 @@ class TTSOrchestrator:
             if not voice_ref:
                 logger.debug("No voice sample for entry seq=%s — skipping", entry.get("sequence_number"))
                 continue
-            seq = int(entry["sequence_number"])
-            units.append(
-                {
-                    "seq": seq,
-                    "entry_type": entry.get("entry_type") or "narration",
-                    "speaker": entry.get("speaker_name") or "Narrator",
-                    "text": text,
-                    "voice_ref": voice_ref,
-                    "audio_url": f"/tts/audio/{novel_id}/{section_index}/{seq}",
-                }
-            )
+            entry_seq = int(entry["sequence_number"])
+            # The untagged source text drives client-side highlight matching; the
+            # tagged ``raw_text`` is what we actually synthesize. Chunking applies
+            # to the synthesized text so no single TTS request exceeds the limit.
+            original_text = (entry.get("original_text") or text).strip()
+            chunks = _split_text_for_tts(text) or [text]
+            for chunk_idx, chunk in enumerate(chunks):
+                seq = entry_seq * _SEQ_STRIDE + chunk_idx
+                units.append(
+                    {
+                        "seq": seq,
+                        "entry_seq": entry_seq,
+                        "chunk_index": chunk_idx,
+                        "chunk_count": len(chunks),
+                        "entry_type": entry.get("entry_type") or "narration",
+                        "speaker": entry.get("speaker_name") or "Narrator",
+                        "text": chunk,
+                        "original_text": original_text,
+                        "voice_ref": voice_ref,
+                        "audio_url": f"/tts/audio/{novel_id}/{section_index}/{seq}",
+                    }
+                )
 
         return {"status": "ready", "section": section_index, "units": units}
 

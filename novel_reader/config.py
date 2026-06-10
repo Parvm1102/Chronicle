@@ -23,6 +23,11 @@ TTS_DEFAULT_NARRATOR_ACTOR = os.environ.get("TTS_DEFAULT_NARRATOR_ACTOR", "Sohee
 # Prefetch is a sliding window: only this many lines past where the engine
 # currently is are generated (spilling into the next section near the end).
 TTS_LOOKAHEAD = int(os.environ.get("TTS_LOOKAHEAD", "4"))
+# Max characters of text sent to the TTS engine in a single request. Longer
+# dialogue/narration entries are split into multiple speakable chunks under this
+# limit (Chatterbox degrades on long inputs). Splitting prefers sentence/clause
+# boundaries and never breaks a word.
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "300"))
 
 
 def ensure_app_dirs() -> None:

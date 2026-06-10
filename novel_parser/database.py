@@ -201,7 +201,19 @@ class DatabaseManager:
             "kwargs": {
                 "row_factory": dict_row,
                 "prepare_threshold": None,  # Required for pgBouncer / Supavisor transaction poolers
+                # Fail fast on a dead/half-open socket instead of blocking
+                # forever. Supabase's Supavisor pooler silently drops idle
+                # upstream connections; without keepalives a query sent into
+                # such a connection hangs indefinitely in poll().
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
             },
+            # Validate a pooled connection before handing it out so a stale one
+            # is recycled rather than used for a query that would hang.
+            "check": ConnectionPool.check_connection,
         }
         # SSL for Supabase
         ssl_mode = self._settings.postgres_ssl_mode
@@ -771,7 +783,32 @@ class DatabaseManager:
                 row = c.execute(query, params).fetchone()
                 return int(row["id"])  # type: ignore[index]
 
+    def get_events_for_section(
+        self, novel_meta_id: int, section_index: int
+    ) -> list[dict[str, Any]]:
+        """All events in a chapter, ordered by sequence_number (for RAG enrichment)."""
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM novel_events
+                WHERE novel_meta_id = %s AND section_index = %s
+                ORDER BY sequence_number
+                """,
+                (novel_meta_id, section_index),
+            ).fetchall()
+
+    def get_events_by_ids(self, event_ids: list[int]) -> list[dict[str, Any]]:
+        """Fetch events by id (used by the chat layer to expand RAG hits)."""
+        if not event_ids:
+            return []
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM novel_events WHERE id = ANY(%s) ORDER BY section_index, sequence_number",
+                (event_ids,),
+            ).fetchall()
+
     # ── voice actors ───────────────────────────────────────────────────────
+
 
     def upsert_voice_actor(
         self,

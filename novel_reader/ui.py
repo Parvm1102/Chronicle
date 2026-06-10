@@ -805,9 +805,6 @@ function syncSettingsPopupState() {
 
 // ── TTS read-aloud player ──────────────────────────────────────────────────
 function ttsBtn() { return q(".speaker-trigger"); }
-function ttsEscape(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
 function ttsSetPlaying(on) { const b = ttsBtn(); if (b) b.classList.toggle("playing", !!on); }
 function ttsSetLoading(on) { const b = ttsBtn(); if (b) b.classList.toggle("loading", !!on); }
 
@@ -822,15 +819,14 @@ function ttsToast(msg) {
   window.__ttsToastTimer = setTimeout(() => { t.classList.remove("show"); }, 6000);
 }
 
-function ttsStop(restore) {
+function ttsStop() {
   const s = window.__tts;
-  if (s) {
-    if (s.audio) { try { s.audio.pause(); } catch (e) {} s.audio.onended = null; s.audio.onerror = null; }
-    if (restore && s.originalHTML != null) {
-      const t = q(".text");
-      if (t) t.innerHTML = s.originalHTML;
-    }
+  if (s && s.audio) {
+    try { s.audio.pause(); } catch (e) {}
+    s.audio.onended = null;
+    s.audio.onerror = null;
   }
+  ttsClearHighlight();
   window.__tts = { active: false };
   ttsSetPlaying(false);
   ttsSetLoading(false);
@@ -838,13 +834,160 @@ function ttsStop(restore) {
 
 function ttsToggle() {
   const s = window.__tts;
-  if (s && s.active) { ttsStop(true); return; }
+  if (s && s.active) { ttsStop(); return; }
   const b = ttsBtn();
   if (!b) return;
   ttsLoadSection(b.dataset.ttsNovel, parseInt(b.dataset.ttsSection, 10), true);
 }
 
-async function ttsLoadSection(novelId, section, userInitiated) {
+// ── non-destructive highlight engine ───────────────────────────────────────
+// We never touch the chapter's HTML. Instead we build a normalized flat-text
+// index of the rendered `.text` (collapsing whitespace, folding case/quotes),
+// locate each dialogue entry's `original_text` within it, and paint the entry
+// currently being spoken using the CSS Custom Highlight API (Chromium 105+).
+
+function ttsNormChar(ch) {
+  if (/\s/.test(ch)) return " ";
+  ch = ch.toLowerCase();
+  if (ch === "\u201c" || ch === "\u201d" || ch === "\u201f" || ch === "\uff02") return '"';
+  if (ch === "\u2018" || ch === "\u2019" || ch === "\u201b" || ch === "`") return "'";
+  if (ch === "\u2014" || ch === "\u2013" || ch === "\u2212") return "-";
+  return ch;
+}
+
+// Build {normStr, map}: normStr is the normalized text; map[k] = {node, offset}
+// points at the DOM position of the k-th normalized character.
+function ttsBuildIndex(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let normStr = "";
+  const map = [];
+  let prevSpace = true; // collapse leading whitespace
+  let node;
+  while ((node = walker.nextNode())) {
+    const t = node.nodeValue;
+    for (let i = 0; i < t.length; i++) {
+      const c = ttsNormChar(t[i]);
+      if (c === " ") {
+        if (prevSpace) continue;
+        prevSpace = true;
+      } else {
+        prevSpace = false;
+      }
+      normStr += c;
+      map.push({ node, offset: i });
+    }
+  }
+  return { normStr, map };
+}
+
+function ttsNormalize(s) {
+  let out = "";
+  let prevSpace = true;
+  for (const ch of String(s)) {
+    const c = ttsNormChar(ch);
+    if (c === " ") { if (prevSpace) continue; prevSpace = true; }
+    else prevSpace = false;
+    out += c;
+  }
+  return out.trim();
+}
+
+// Match each entry's original_text into the index, forward-only with a moving
+// cursor. Returns { entrySeq: {range, start, end, entrySeq} }. Misses are
+// skipped (audio still plays, just without a highlight).
+function ttsMatchEntries(index, units) {
+  const byEntry = [];
+  const seen = new Set();
+  for (const u of units) {
+    if (seen.has(u.entry_seq)) continue;
+    seen.add(u.entry_seq);
+    byEntry.push({ entrySeq: u.entry_seq, text: u.original_text || u.text });
+  }
+  const { normStr, map } = index;
+  let cursor = 0;
+  const result = {};
+  for (const e of byEntry) {
+    const needle = ttsNormalize(e.text);
+    if (!needle) continue;
+    let pos = normStr.indexOf(needle, cursor);
+    if (pos < 0) pos = normStr.indexOf(needle); // fall back to a global search
+    if (pos < 0) continue;
+    const a = map[pos];
+    const bEnd = map[pos + needle.length - 1];
+    if (!a || !bEnd) continue;
+    try {
+      const range = document.createRange();
+      range.setStart(a.node, a.offset);
+      range.setEnd(bEnd.node, bEnd.offset + 1);
+      result[e.entrySeq] = { range, start: pos, end: pos + needle.length, entrySeq: e.entrySeq };
+      cursor = pos + needle.length;
+    } catch (err) {}
+  }
+  return result;
+}
+
+function ttsHasHighlightApi() {
+  return typeof Highlight !== "undefined" && window.CSS && CSS.highlights;
+}
+
+function ttsClearHighlight() {
+  if (ttsHasHighlightApi()) CSS.highlights.delete("tts-active");
+}
+
+function ttsHighlightEntry(entrySeq) {
+  const s = window.__tts;
+  if (!s || !s.entryRanges) return;
+  const m = s.entryRanges[entrySeq];
+  if (!m) { ttsClearHighlight(); return; }
+  if (ttsHasHighlightApi()) {
+    CSS.highlights.set("tts-active", new Highlight(m.range));
+  }
+  const rect = m.range.getBoundingClientRect();
+  if (rect && (rect.height || rect.width)) {
+    const y = rect.top + window.scrollY - window.innerHeight / 2;
+    window.scrollTo({ top: Math.max(0, y), behavior: "smooth" });
+  }
+}
+
+// Resolve a DOM point (node, offset) to a normalized flat-text offset.
+function ttsOffsetOfPoint(index, node, offset) {
+  const map = index.map;
+  // Direct hit: a text node whose char at/after `offset` is mapped.
+  for (let k = 0; k < map.length; k++) {
+    if (map[k].node === node && map[k].offset >= offset) return k;
+  }
+  // Point past this node's mapped chars → position just after its last char.
+  for (let k = map.length - 1; k >= 0; k--) {
+    if (map[k].node === node) return k + 1;
+  }
+  // Element-node selection start: use the first mapped descendant text node.
+  if (node && node.nodeType === 1 && node.childNodes[offset]) {
+    const target = node.childNodes[offset];
+    for (let k = 0; k < map.length; k++) {
+      if (target.contains ? target.contains(map[k].node) : map[k].node === target) return k;
+    }
+  }
+  return 0;
+}
+
+// Earliest entry that the selection start falls within (or the next entry after
+// it if the point lands in a gap). Entry ranges are in increasing order.
+function ttsPickStartEntry(entryRanges, startOff) {
+  const arr = Object.values(entryRanges).sort((a, b) => a.start - b.start);
+  if (!arr.length) return null;
+  let chosen = null;
+  for (const e of arr) {
+    if (e.start <= startOff) chosen = e;
+    else { if (!chosen) chosen = e; break; }
+  }
+  if (chosen && chosen.end <= startOff) {
+    const after = arr.find(e => e.start > startOff);
+    if (after) chosen = after;
+  }
+  return chosen ? chosen.entrySeq : null;
+}
+
+async function ttsLoadSection(novelId, section, userInitiated, startOff) {
   ttsSetLoading(true);
   let data;
   try {
@@ -853,26 +996,36 @@ async function ttsLoadSection(novelId, section, userInitiated) {
   } catch (e) {
     ttsSetLoading(false);
     if (userInitiated) ttsToast("TTS service is offline.");
-    ttsStop(true);
+    ttsStop();
     return;
   }
   ttsSetLoading(false);
   if (data.status !== "ready") {
     if (userInitiated) ttsToast(data.message || "Parsing in progress…");
-    ttsStop(true);
+    ttsStop();
     return;
   }
   const textEl = q(".text");
-  if (!textEl) { ttsStop(true); return; }
+  if (!textEl) { ttsStop(); return; }
   if (!data.units || data.units.length === 0) { ttsAdvanceSection(novelId, section); return; }
 
-  const originalHTML = textEl.innerHTML;
-  textEl.innerHTML = data.units.map(u =>
-    `<p class="tts-unit" id="tts-u-${u.seq}" data-seq="${u.seq}">${ttsEscape(u.text)}</p>`
-  ).join("");
-  window.__tts = { active: true, novelId, section, units: data.units, idx: 0, audio: null, nextAudio: null, originalHTML };
+  const index = ttsBuildIndex(textEl);
+  const entryRanges = ttsMatchEntries(index, data.units);
+  window.__tts = {
+    active: true, novelId, section, units: data.units, idx: 0,
+    audio: null, nextAudio: null, entryRanges, curEntrySeq: null,
+  };
   ttsSetPlaying(true);
-  ttsPlayIdx(0);
+
+  let startIdx = 0;
+  if (startOff != null) {
+    const seq = ttsPickStartEntry(entryRanges, startOff);
+    if (seq != null) {
+      const i = data.units.findIndex(u => u.entry_seq === seq);
+      if (i >= 0) startIdx = i;
+    }
+  }
+  ttsPlayIdx(startIdx);
 }
 
 function ttsPlayIdx(i) {
@@ -880,10 +1033,13 @@ function ttsPlayIdx(i) {
   if (!s || !s.active) return;
   if (i >= s.units.length) { ttsAdvanceSection(s.novelId, s.section); return; }
   s.idx = i;
-  document.querySelectorAll(".tts-unit.tts-active").forEach(e => e.classList.remove("tts-active"));
   const unit = s.units[i];
-  const el = document.getElementById(`tts-u-${unit.seq}`);
-  if (el) { el.classList.add("tts-active"); el.scrollIntoView({ behavior: "smooth", block: "center" }); }
+
+  // Per-entry highlight: only repaint when the spoken entry changes.
+  if (s.curEntrySeq !== unit.entry_seq) {
+    s.curEntrySeq = unit.entry_seq;
+    ttsHighlightEntry(unit.entry_seq);
+  }
 
   // Slide the server-side prefetch window forward to track the playback head.
   fetch(`/tts/prefetch?novel_id=${s.novelId}&section=${s.section}&seq=${unit.seq}`).catch(() => {});
@@ -906,11 +1062,26 @@ function ttsPlayIdx(i) {
   }
 }
 
+// Start (or restart) read-aloud from the user's current text selection.
+function ttsSpeakFromSelection() {
+  const reader = q(".text");
+  const sel = getSelection();
+  if (!reader || !sel || sel.isCollapsed) return;
+  if (!reader.contains(sel.anchorNode) || !reader.contains(sel.focusNode)) return;
+  const range = sel.getRangeAt(0);
+  const index = ttsBuildIndex(reader);
+  const startOff = ttsOffsetOfPoint(index, range.startContainer, range.startOffset);
+  const b = ttsBtn();
+  if (!b) return;
+  ttsStop();
+  ttsLoadSection(b.dataset.ttsNovel, parseInt(b.dataset.ttsSection, 10), true, startOff);
+}
+
 // Hand off to the next chapter via the reader's own Next button so the chapter
 // title, progress bar and chapter rail all update. A poller then resumes TTS
 // once the new section has rendered.
 function ttsAdvanceSection(novelId, curSection) {
-  ttsStop(true);
+  ttsStop();
   ttsSetPlaying(true);
   ttsSetLoading(true);
   window.__ttsAuto = { novelId: String(novelId), from: curSection, expect: curSection + 1, tries: 0 };
@@ -931,8 +1102,8 @@ function ttsAutoPoll() {
   } else {
     auto.tries++;
     // Section never advanced → end of book (or stuck): stop cleanly.
-    if (auto.tries > 8 && cur === auto.from) { window.__ttsAuto = null; ttsStop(true); }
-    else if (auto.tries > 40) { window.__ttsAuto = null; ttsStop(true); }
+    if (auto.tries > 8 && cur === auto.from) { window.__ttsAuto = null; ttsStop(); }
+    else if (auto.tries > 40) { window.__ttsAuto = null; ttsStop(); }
   }
 }
 
@@ -1029,10 +1200,10 @@ function bootReader() {
     const proxy = event.target.closest("[data-click]");
     if (proxy) {
       // A manual navigation/theme/font click while reading aloud: stop TTS so the
-      // re-rendered page isn't left with stale highlighted units. (Auto-advance
-      // sets window.__ttsAuto and is exempt.)
+      // highlight is cleared before the page re-renders. (Auto-advance sets
+      // window.__ttsAuto and is exempt.)
       if (window.__tts && window.__tts.active && !window.__ttsAuto) {
-        ttsStop(false);
+        ttsStop();
       }
       const themeKey = THEMES[proxy.dataset.click];
       if (themeKey) applyTheme(themeKey);
@@ -1058,7 +1229,7 @@ function bootReader() {
       } else if (action.dataset.a === "bookmark" && text) {
         click("nr-bookmark");
       } else if (action.dataset.a === "speak-selected" && text) {
-        click("nr-speak-selected");
+        ttsSpeakFromSelection();
       }
       bar.classList.remove("show");
       return;
@@ -1607,13 +1778,15 @@ READER_CSS = CSS + """
 .speaker-trigger.loading .speaker-icon { animation: ttsPulse 1s ease-in-out infinite; }
 @keyframes ttsPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-/* Spoken-unit highlight (rendered while reading aloud) */
-.tts-unit { transition: background-color 0.2s ease, color 0.2s ease; border-radius: 4px; }
-.tts-unit.tts-active {
-  background: rgba(47, 128, 237, 0.18);
-  box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.18);
+/* Spoken-entry highlight, painted via the CSS Custom Highlight API while
+   reading aloud. Non-destructive: the chapter's own HTML is never modified. */
+::highlight(tts-active) {
+  background-color: rgba(47, 128, 237, 0.22);
+  color: inherit;
 }
-[data-theme="dark"] .tts-unit.tts-active { background: rgba(120, 170, 255, 0.22); box-shadow: 0 0 0 3px rgba(120,170,255,.22); }
+[data-theme="dark"] ::highlight(tts-active) {
+  background-color: rgba(120, 170, 255, 0.28);
+}
 
 /* Transient "parse in progress" toast */
 #tts-toast {

@@ -10,3 +10,17 @@ pydantic>=2.0
 pydantic-settings>=2.0
 openai>=1.0
 python-dotenv>=1.0
+
+# novel_rag (vector DB / temporal-aware RAG) dependencies
+llama-index-core>=0.11
+llama-index-vector-stores-qdrant>=0.3
+llama-index-embeddings-fastembed>=0.2
+qdrant-client>=1.11
+fastembed>=0.3
+
+# novel_rag GPU acceleration (optional — set RAG_USE_GPU=true).
+# Provides torch / sentence-transformers dense embedding + reranking on CUDA.
+# Install with: pip install torch sentence-transformers llama-index-embeddings-huggingface
+# torch>=2.2
+# sentence-transformers>=3.0
+# llama-index-embeddings-huggingface>=0.3

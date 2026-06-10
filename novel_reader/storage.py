@@ -337,6 +337,15 @@ class LibraryStore:
                 import logging
                 logging.getLogger(__name__).warning("Failed to delete novel from PostgreSQL: %s", e)
 
+            try:
+                from novel_rag.client import delete_novel_points
+                delete_novel_points(novel["uuid"])
+            except ImportError:
+                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to delete novel from Qdrant: %s", e)
+
             novel_dir = Path(str(novel["stored_path"])).parent.parent
             if novel_dir.exists() and novel_dir.parent == NOVELS_DIR:
                 shutil.rmtree(novel_dir)

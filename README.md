@@ -286,3 +286,4 @@ chatterbox-trying/      Chatterbox source (installed into the TTS image)
 | `docker compose up tts` fails on GPU | Install the NVIDIA Container Toolkit, or set `TTS_DEVICE=cpu` and drop the `deploy:` block. |
 | First TTS request is slow | The model downloads from HuggingFace on first run and loads into VRAM; subsequent requests are cached. |
 | `python: command not found` | Use `python3` (or activate the venv: `source .venv/bin/activate`). |
+|quering the vector db | run `./.venv/bin/python -m novel_rag.query <uuid> -c <chapter number> --full "your query"`

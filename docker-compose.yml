@@ -23,6 +23,19 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Qdrant vector database for the temporal-aware RAG layer.
+  # The main app reaches it at http://localhost:6333 (or http://qdrant:6333
+  # from inside the compose network). For a managed cluster instead, leave this
+  # service stopped and set QDRANT_URL / QDRANT_API_KEY in .env.
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
   # Chatterbox-Turbo TTS microservice (GPU).
   # Requires the NVIDIA Container Toolkit on the host.
   # Build context is the repo root so the image can install the local
@@ -54,3 +67,4 @@ services:
 
 volumes:
   pgdata:
+  qdrant_data:
