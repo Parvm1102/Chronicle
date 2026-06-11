@@ -17,7 +17,7 @@ llama-index-vector-stores-qdrant>=0.3
 llama-index-embeddings-fastembed>=0.2
 qdrant-client>=1.11
 fastembed>=0.3
-
+modal>=1.5.0
 # novel_rag GPU acceleration (optional — set RAG_USE_GPU=true).
 # Provides torch / sentence-transformers dense embedding + reranking on CUDA.
 # Install with: pip install torch sentence-transformers llama-index-embeddings-huggingface

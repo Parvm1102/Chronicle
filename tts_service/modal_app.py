@@ -11,7 +11,7 @@ Modal will print a public URL. Point the main app at it:
     TTS_SERVICE_URL=https://<your-workspace>--novel-reader-tts-ttsservice-fastapi-app.modal.run
 
 Notes / things you may want to tweak at deploy time:
-* ``gpu="A10G"`` is a sensible default for Turbo; change as needed.
+* ``gpu="T4"`` is plenty for Turbo; bump to ``A10G``/``A100`` if you need more.
 * Voice samples are baked into the image so ``voice_ref`` resolution works with
   no mount. If you prefer to update voices without rebuilding, move them to a
   ``modal.Volume`` and mount it at ``/voice_samples`` instead.
@@ -36,10 +36,6 @@ image = (
     # Install Chatterbox straight from upstream at the pinned commit
     # (pulls torch==2.6.0, transformers==5.2.0, … per its pyproject).
     .pip_install(CHATTERBOX_GIT)
-    # Bake voice samples so voice_ref resolution needs no runtime mount.
-    .add_local_dir("voice_samples", "/voice_samples", copy=True)
-    # Our service package.
-    .add_local_python_source("tts_service")
     .env(
         {
             "TTS_DEVICE": "cuda",
@@ -47,6 +43,11 @@ image = (
             "TTS_CACHE_DIR": "/cache",
         }
     )
+    # add_local_* steps must come last: Modal forbids build steps (env/run/pip)
+    # after local files are added. Bake voice samples so voice_ref resolution
+    # needs no runtime mount, and add our service package.
+    .add_local_dir("voice_samples", "/voice_samples", copy=True)
+    .add_local_python_source("tts_service")
 )
 
 app = modal.App("novel-reader-tts")
@@ -58,7 +59,7 @@ tts_cache = modal.Volume.from_name("novel-reader-tts-cache", create_if_missing=T
 
 @app.cls(
     image=image,
-    gpu="A10G",
+    gpu="T4",
     volumes={"/root/.cache/huggingface": hf_cache, "/cache": tts_cache},
     scaledown_window=300,
     timeout=600,

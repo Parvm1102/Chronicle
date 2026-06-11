@@ -749,6 +749,29 @@ READER_JS = r"""
   document.documentElement.setAttribute('data-theme', t);
 })();
 
+// When embedded in Hugging Face's auto-resizing iframe, `100vh` references the
+// iframe's own (growing) height, creating a runaway feedback loop that inflates
+// the layout to tens of thousands of pixels of blank space. Lock --app-h to a
+// stable pixel height derived from the physical screen so the loop can't run.
+// On a normal full-page load (window.top === window) we leave the 100vh default.
+(function() {
+  var embedded;
+  try { embedded = window.self !== window.top; } catch (e) { embedded = true; }
+  if (!embedded) return;
+  function applyAppHeight() {
+    var avail = (window.screen && window.screen.availHeight) || 900;
+    var ih = window.innerHeight || 0;
+    // Trust innerHeight only while it is still a sane (non-inflated) value.
+    var h = (ih > 0 && ih <= avail) ? ih : (avail - 96);
+    h = Math.max(480, Math.min(h, 1200));
+    document.documentElement.style.setProperty('--app-h', h + 'px');
+  }
+  applyAppHeight();
+  window.addEventListener('resize', applyAppHeight);
+  // Re-settle after Hugging Face's iframe resizer has had a chance to run.
+  [200, 600, 1200, 2500].forEach(function(ms) { setTimeout(applyAppHeight, ms); });
+})();
+
 const q = (sel, root = document) => root.querySelector(sel);
 const setBox = (id, value) => {
   const field = q(`#${id} textarea, #${id} input`);
@@ -1367,6 +1390,9 @@ CSS = """
 /* ── Unified theme tokens ────────────────────────────────────────── */
 :root,
 html[data-theme=sepia] {
+  /* App height: full viewport locally; overridden to a fixed px height by JS
+     when embedded in Hugging Face's auto-resizing iframe (see *_JS). */
+  --app-h:100vh;
   --bg:#f4ead0; --paper:#f7edcf; --ink:#2b2118; --muted:#756854;
   --line:rgba(43,33,24,.18); --card-bg:rgba(244,235,208,.72);
   --card-hover:rgba(244,235,208,.96); --rail-bg:#2e2416;
@@ -1589,13 +1615,13 @@ html[data-theme=dark] .meta-row { border-bottom-color:rgba(255,255,255,0.05); }
 
 /* ── Reader layout ────────────────────────────────────────────────── */
 @media (min-width: 861px) {
-  .reader-grid { display:flex!important; flex-direction:row!important; align-items:stretch!important; min-height:100vh!important; gap:0!important; }
-  .chapter-rail { display:flex!important; flex-direction:column!important; flex-wrap:nowrap!important; position:sticky!important; top:0!important; height:100vh!important; overflow-y:auto!important; overflow-x:hidden!important; flex:0 0 280px!important; min-width:280px!important; max-width:280px!important; background:var(--rail-bg)!important; color:var(--rail-fg)!important; padding:18px 0!important; border-right:1px solid var(--rail-border)!important; box-sizing:border-box!important; z-index:100!important; }
+  .reader-grid { display:flex!important; flex-direction:row!important; align-items:stretch!important; min-height:var(--app-h)!important; gap:0!important; }
+  .chapter-rail { display:flex!important; flex-direction:column!important; flex-wrap:nowrap!important; position:sticky!important; top:0!important; height:var(--app-h)!important; overflow-y:auto!important; overflow-x:hidden!important; flex:0 0 280px!important; min-width:280px!important; max-width:280px!important; background:var(--rail-bg)!important; color:var(--rail-fg)!important; padding:18px 0!important; border-right:1px solid var(--rail-border)!important; box-sizing:border-box!important; z-index:100!important; }
   .reader-body { flex:1!important; min-width:0!important; box-sizing:border-box!important; display:flex!important; flex-direction:column!important; }
 }
 
 @media (max-width: 860px) {
-  .reader-grid { min-height:100vh; gap:0!important; }
+  .reader-grid { min-height:var(--app-h); gap:0!important; }
   .chapter-rail { display:none!important; }
 }
 
@@ -1634,7 +1660,7 @@ html[data-theme=dark] .meta-row { border-bottom-color:rgba(255,255,255,0.05); }
 .top nav { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
 .top a, .top button { border:1px solid var(--reader-line)!important; background:transparent!important; border-radius:6px!important; color:var(--reader-ink)!important; box-shadow:none!important; text-decoration:none; padding:7px 10px; }
 .top span { min-width:54px; text-align:center; color:var(--reader-muted); font-size:13px; }
-.page { min-height:calc(100vh - 64px); padding:64px clamp(26px,8vw,130px); color:var(--reader-ink)!important; background:var(--reader-bg)!important; }
+.page { min-height:calc(var(--app-h) - 64px); padding:64px clamp(26px,8vw,130px); color:var(--reader-ink)!important; background:var(--reader-bg)!important; }
 .text { max-width:930px; margin:auto; text-align:center; font:var(--font,22px)/1.32 Georgia,serif; color:var(--reader-ink)!important; }
 /* Force ALL descendants inside .text to use reader-ink — prevents EPUB inline color styles from creating unreadable light text on light backgrounds */
 .text * { color:var(--reader-ink)!important; }
@@ -2038,6 +2064,24 @@ CHAT_JS = r"""
   document.documentElement.setAttribute('data-theme', t);
 })();
 
+// See READER_JS: lock --app-h to a stable height when embedded in HF's
+// auto-resizing iframe so `100vh`-based layout can't inflate into blank space.
+(function() {
+  var embedded;
+  try { embedded = window.self !== window.top; } catch (e) { embedded = true; }
+  if (!embedded) return;
+  function applyAppHeight() {
+    var avail = (window.screen && window.screen.availHeight) || 900;
+    var ih = window.innerHeight || 0;
+    var h = (ih > 0 && ih <= avail) ? ih : (avail - 96);
+    h = Math.max(480, Math.min(h, 1200));
+    document.documentElement.style.setProperty('--app-h', h + 'px');
+  }
+  applyAppHeight();
+  window.addEventListener('resize', applyAppHeight);
+  [200, 600, 1200, 2500].forEach(function(ms) { setTimeout(applyAppHeight, ms); });
+})();
+
 const cq = (sel, root = document) => root.querySelector(sel);
 const cqa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
@@ -2263,7 +2307,7 @@ CHAT_CSS = CSS + """
    (which otherwise pushed the top bar / composer off-edge and added a page
    scrollbar). Scoped to the /chat page only. */
 html, body { height:100%; overflow:hidden; }
-.gradio-container { height:100vh!important; overflow:hidden!important; }
+.gradio-container { height:var(--app-h)!important; overflow:hidden!important; }
 .gradio-container > .main,
 .gradio-container .main > .wrap,
 .gradio-container .contain,
@@ -2273,12 +2317,12 @@ html, body { height:100%; overflow:hidden; }
   padding:0!important; margin:0!important; gap:0!important;
   max-width:none!important; border:none!important;
 }
-.gradio-container .contain > .gap > .block { height:100vh!important; }
+.gradio-container .contain > .gap > .block { height:var(--app-h)!important; }
 
-.chat-app { display:flex; flex-direction:row; height:100vh; width:100%; overflow:hidden; box-sizing:border-box; }
+.chat-app { display:flex; flex-direction:row; height:var(--app-h); width:100%; overflow:hidden; box-sizing:border-box; }
 
 .chat-sidebar {
-  flex:0 0 300px; width:300px; height:100vh; overflow-y:auto; overflow-x:hidden;
+  flex:0 0 300px; width:300px; height:var(--app-h); overflow-y:auto; overflow-x:hidden;
   background:var(--paper); border-right:1px solid var(--line);
   display:flex; flex-direction:column; box-sizing:border-box; transition:margin-left .25s ease;
 }
@@ -2313,7 +2357,7 @@ html, body { height:100%; overflow:hidden; }
 .chat-char-role.role-protagonist, .chat-char-role.role-deuteragonist { color:var(--blue); font-weight:600; }
 .chat-char-role.role-antagonist { color:var(--warn); font-weight:600; }
 
-.chat-main { flex:1; min-width:0; height:100vh; display:flex; flex-direction:column; background:var(--bg); }
+.chat-main { flex:1; min-width:0; height:var(--app-h); display:flex; flex-direction:column; background:var(--bg); }
 .chat-top {
   flex:0 0 auto; height:64px; display:flex; align-items:center; gap:14px; padding:0 22px;
   border-bottom:1px solid var(--line); background:var(--paper);

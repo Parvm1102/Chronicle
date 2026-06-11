@@ -21,6 +21,7 @@ class LibraryStore:
         ensure_app_dirs()
         self.db_path = db_path
         self.init_db()
+        self.backfill_missing_covers()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -287,6 +288,46 @@ class LibraryStore:
                 "UPDATE novels SET series = ?, genres = ?, file_size = ?, updated_at = ? WHERE id = ?",
                 (series, genres, file_size, utc_now(), novel_id),
             )
+
+    def backfill_missing_covers(self) -> int:
+        """Re-extract covers for existing novels that have no cover image.
+
+        Runs at startup and is idempotent: it only touches rows where
+        cover_image is empty and the original source file still exists. This
+        lets older novels (ingested before cover-extraction improvements) gain
+        a cover without re-uploading or re-running the parsing pipeline.
+        """
+        try:
+            from .parsers import extract_cover_info
+        except Exception:
+            return 0
+
+        updated = 0
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, stored_path, series, genres FROM novels "
+                "WHERE COALESCE(cover_image, '') = ''"
+            ).fetchall()
+            for row in rows:
+                source_path = Path(row["stored_path"])
+                if not source_path.exists():
+                    continue
+                try:
+                    info = extract_cover_info(source_path)
+                except Exception:
+                    continue
+                if not info.cover_b64:
+                    continue
+                conn.execute(
+                    "UPDATE novels SET cover_image = ?, "
+                    "series = CASE WHEN COALESCE(series, '') = '' THEN ? ELSE series END, "
+                    "genres = CASE WHEN COALESCE(genres, '') = '' THEN ? ELSE genres END, "
+                    "updated_at = ? WHERE id = ?",
+                    (info.cover_b64, info.series, info.genres, utc_now(), row["id"]),
+                )
+                updated += 1
+        return updated
+
 
     def archive_novel(self, novel_id: int) -> None:
         now = utc_now()

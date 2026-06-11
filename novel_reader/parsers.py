@@ -31,25 +31,53 @@ def extract_cover_info(path: Path) -> BookCoverInfo:
 def _epub_cover_info(path: Path) -> BookCoverInfo:
     """Extract cover image + series/genres from an EPUB."""
     try:
-        from ebooklib import ITEM_IMAGE, epub
+        import ebooklib
+        from ebooklib import ITEM_COVER, ITEM_IMAGE, epub
         book = epub.read_epub(str(path))
+
+        def _as_data_uri(item) -> str:
+            mt = getattr(item, "media_type", None) or "image/jpeg"
+            return f"data:{mt};base64,{base64.b64encode(item.get_content()).decode()}"
 
         # --- cover image ---
         cover_b64 = ""
-        # Try common cover identifiers
-        for item in book.get_items():
-            if item.get_type() == ITEM_IMAGE:
+
+        # 1) Dedicated cover items (EPUB3 properties="cover-image" -> ITEM_COVER)
+        for item in book.get_items_of_type(ITEM_COVER):
+            try:
+                if item.get_content():
+                    cover_b64 = _as_data_uri(item)
+                    break
+            except Exception:
+                continue
+
+        # 2) <meta name="cover" content="..."> pointing at a manifest item id
+        if not cover_b64:
+            try:
+                cover_meta = book.get_metadata("OPF", "cover")
+                cover_id = ""
+                if cover_meta:
+                    cover_id = (cover_meta[0][1] or {}).get("content", "")
+                if cover_id:
+                    item = book.get_item_with_id(cover_id)
+                    if item is not None and item.get_content():
+                        cover_b64 = _as_data_uri(item)
+            except Exception:
+                pass
+
+        # 3) Image item whose name/id hints at a cover
+        if not cover_b64:
+            for item in book.get_items_of_type(ITEM_IMAGE):
                 name_lower = (item.get_name() or "").lower()
                 item_id_lower = (item.id or "").lower()
                 if any(k in name_lower or k in item_id_lower for k in ("cover", "title")):
-                    mt = item.media_type or "image/jpeg"
-                    cover_b64 = f"data:{mt};base64,{base64.b64encode(item.get_content()).decode()}"
+                    cover_b64 = _as_data_uri(item)
                     break
-        # Fallback: first image item
+
+        # 4) Fallback: first image item
         if not cover_b64:
             for item in book.get_items_of_type(ITEM_IMAGE):
-                mt = item.media_type or "image/jpeg"
-                cover_b64 = f"data:{mt};base64,{base64.b64encode(item.get_content()).decode()}"
+                cover_b64 = _as_data_uri(item)
                 break
 
         # --- series metadata ---
