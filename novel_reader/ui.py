@@ -173,10 +173,12 @@ def _dashboard(selected_id: int | None = None) -> str:
     return f"""
     <main class="dashboard">
       <header>
-        <div>
-          <p>Novel Reader</p>
-          <h1>Dashboard</h1>
-          <small>{len(active)} active · {len(archived)} archived</small>
+        <div class="brand">
+          <img class="brand-logo" src="/public/light_theme.jpeg" alt="Chronicle logo" />
+          <div class="brand-text">
+            <h1 class="brand-title">Chronicle: The AI Novel Reader</h1>
+            <p class="brand-tagline">Break The Fourth Wall</p>
+          </div>
         </div>
         <div class="dashboard-theme-selector">
           <button type="button" id="dashboard-upload-btn" class="upload-btn-trigger" onclick="openUploadModal()">+ Upload</button>
@@ -1302,6 +1304,12 @@ THEME_JS = """
   var t = localStorage.getItem('nr-theme') || 'sepia';
   document.documentElement.setAttribute('data-theme', t);
 
+  function applyLogo(theme) {
+    var src = theme === 'dark' ? '/public/dark_theme.jpeg' : '/public/light_theme.jpeg';
+    document.querySelectorAll('.brand-logo').forEach(function(img) { img.src = src; });
+  }
+  applyLogo(t);
+
   document.addEventListener("click", function(e) {
     var card = e.target.closest(".book-card");
     if (card) {
@@ -1320,6 +1328,7 @@ THEME_JS = """
       var theme = btn.getAttribute("data-theme-set");
       localStorage.setItem('nr-theme', theme);
       document.documentElement.setAttribute('data-theme', theme);
+      applyLogo(theme);
     }
   });
 })();
@@ -1438,10 +1447,14 @@ body, .gradio-container { margin:0!important; padding:0!important; max-width:non
 footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn, .show-api { display:none!important; }
 /* ── Dashboard ────────────────────────────────────────────────────── */
 .dashboard { width:min(1120px,calc(100vw - 48px)); margin:auto; padding:48px 0; }
-.dashboard header { display:flex; justify-content:space-between; align-items:flex-end; border-bottom:1px solid var(--line); padding-bottom:20px; margin-bottom:28px; }
+.dashboard header { display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--line); padding-bottom:20px; margin-bottom:28px; }
 .dashboard header p, .dashboard h1, .dashboard small { margin:0; }
-.dashboard header p { color:var(--muted); text-transform:uppercase; font-size:12px; }
-.dashboard h1 { font:400 clamp(44px,7vw,82px)/1 Georgia,serif; color:var(--ink); }
+.brand { display:flex; align-items:center; gap:16px; }
+.brand-logo { width:64px; height:64px; border-radius:12px; object-fit:cover; box-shadow:0 2px 10px rgba(0,0,0,0.15); flex:0 0 auto; }
+.brand-text { display:flex; flex-direction:column; gap:4px; }
+.brand-title { font:700 clamp(24px,3vw,34px)/1.1 Inter,system-ui,sans-serif; color:var(--ink); }
+html[data-theme=dark] .brand-title { color:#ffffff; }
+.brand-tagline { font-size:14px; font-weight:600; letter-spacing:0.5px; color:var(--blue); text-transform:uppercase; }
 .dashboard-theme-selector { display:flex; gap:8px; align-items:center; }
 .dashboard-theme-selector button { border:1px solid var(--line)!important; background:transparent!important; border-radius:6px!important; color:var(--ink)!important; box-shadow:none!important; text-decoration:none; padding:7px 14px; cursor:pointer; font-size:13px; font-weight:500; transition:all .2s; }
 .dashboard-theme-selector button:hover { background:var(--line)!important; }
@@ -1449,6 +1462,7 @@ footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn
 .dashboard-theme-selector .upload-btn-trigger:hover { filter:brightness(1.08); background:var(--blue)!important; }
 .dashboard h2 { margin:36px 0 12px; font-size:14px; color:var(--muted); text-transform:uppercase; }
 .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:24px 18px; }
+.cards .empty { grid-column:1/-1; color:var(--ink)!important; font-size:15px; padding:8px 0; }
 
 /* Book Card */
 .book-card { display:flex; flex-direction:column; text-decoration:none; border:1px solid var(--line); border-radius:12px; background:var(--card-bg); color:var(--ink)!important; overflow:hidden; transition:all 0.25s cubic-bezier(0.4, 0, 0.2, 1); box-shadow:0 2px 8px rgba(0,0,0,0.04); height: 100%; position: relative; }

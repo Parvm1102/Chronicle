@@ -9,12 +9,16 @@ import gradio as gr
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from novel_reader.ui import CSS, READER_CSS, READER_JS, THEME_JS, CHAT_CSS, CHAT_JS, build_dashboard_app, build_reader_app, build_chat_app
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+_PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public")
+app.mount("/public", StaticFiles(directory=_PUBLIC_DIR), name="public")
 
 
 @app.on_event("startup")
@@ -89,6 +93,11 @@ def root():
 @app.head("/")
 def root_head():
     return RedirectResponse("/dashboard/")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return RedirectResponse("/public/light_theme.ico")
 
 
 # ── TTS narration routes ────────────────────────────────────────────────────
