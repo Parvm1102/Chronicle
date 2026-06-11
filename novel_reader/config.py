@@ -30,6 +30,20 @@ TTS_LOOKAHEAD = int(os.environ.get("TTS_LOOKAHEAD", "4"))
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "300"))
 
 
+# --- In-character chat ---
+# Number of most-recent message turns kept verbatim in the prompt; older turns
+# are folded into a rolling summary once the history grows past the token budget.
+CHAT_HISTORY_TURNS = int(os.environ.get("CHAT_HISTORY_TURNS", "8"))
+# Approx token budget for verbatim history before summarisation kicks in.
+CHAT_SUMMARY_TOKEN_BUDGET = int(os.environ.get("CHAT_SUMMARY_TOKEN_BUDGET", "2500"))
+# Spoiler-safe RAG chunks fed to the character per reply.
+CHAT_RAG_TOP_K = int(os.environ.get("CHAT_RAG_TOP_K", "6"))
+# Max tokens the character may generate per reply. A generous ceiling so a
+# normal in-character answer finishes naturally (the prompt already asks for
+# concise replies); it only guards against runaway generation.
+CHAT_MAX_TOKENS = int(os.environ.get("CHAT_MAX_TOKENS", "2048"))
+
+
 def ensure_app_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     NOVELS_DIR.mkdir(exist_ok=True)

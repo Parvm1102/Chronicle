@@ -124,6 +124,35 @@ class LLMClient:
             what="structured response",
         )
 
+    def chat_stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ):
+        """Stream a chat completion, yielding content deltas as they arrive.
+
+        Unlike :meth:`chat`, this does not retry — streaming is used for
+        interactive chat where a partial response is preferable to a stall.
+        """
+        # Suppress Qwen "thinking" so the budget is spent on the answer, not on
+        # hidden scratch-work (which would otherwise truncate the visible reply).
+        if self._provider == LLMProvider.OLLAMA or "qwen" in self._model.lower():
+            messages = self._with_no_think(messages)
+        kwargs = self._build_kwargs(messages, False, max_tokens)
+        kwargs["stream"] = True
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        stream = self._client.chat.completions.create(**kwargs)
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            piece = getattr(delta, "content", None)
+            if piece:
+                yield piece
+
     # ── internals ──────────────────────────────────────────────────────────
 
     def _build_kwargs(

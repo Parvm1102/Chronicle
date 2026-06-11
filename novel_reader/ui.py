@@ -25,13 +25,28 @@ def build_dashboard_app() -> gr.Blocks:
             star = gr.Button("Star", elem_id="action-star")
             archive = gr.Button("Archive", elem_id="action-archive")
             delete = gr.Button("Delete", elem_id="action-delete")
-        upload = gr.File(label="Add TXT, EPUB, or PDF", file_types=[".txt", ".epub", ".pdf"])
+        with gr.Column(elem_id="upload-modal", elem_classes=["upload-modal-overlay"]):
+            with gr.Column(elem_classes=["upload-modal-card"]):
+                gr.HTML(
+                    "<div class='upload-modal-head'>"
+                    "<h3>Add a book</h3>"
+                    "<button type='button' class='upload-modal-close' onclick='closeUploadModal()' aria-label='Close'>&times;</button>"
+                    "</div>"
+                )
+                upload = gr.File(
+                    label="Drag file here or click to upload",
+                    file_types=[".txt", ".epub", ".pdf"],
+                    elem_classes=["upload-dropzone"],
+                )
+                gr.HTML("<p class='upload-modal-hint'>Supports TXT, EPUB, or PDF files.</p>")
         refresh = gr.Button("Refresh")
         msg = gr.HTML()
 
         demo.load(_dashboard_load, outputs=[library, detail, selected_id, msg])
         refresh.click(_dashboard_refresh, outputs=[library, detail, selected_id, msg])
-        upload.upload(_upload, upload, [library, detail, selected_id, msg])
+        upload.upload(_upload, upload, [library, detail, selected_id, msg]).then(
+            None, None, None, js="() => closeUploadModal()"
+        )
         select.click(_dashboard_select, outputs=[library, detail, selected_id, msg])
         clear.click(_dashboard_clear, outputs=[library, detail, selected_id, msg])
         star.click(_toggle_star, selected_id, [library, detail, selected_id, msg])
@@ -164,6 +179,7 @@ def _dashboard(selected_id: int | None = None) -> str:
           <small>{len(active)} active · {len(archived)} archived</small>
         </div>
         <div class="dashboard-theme-selector">
+          <button type="button" id="dashboard-upload-btn" class="upload-btn-trigger" onclick="openUploadModal()">+ Upload</button>
           <button data-theme-set="sepia" class="theme-btn sepia-btn">Sepia</button>
           <button data-theme-set="light" class="theme-btn light-btn">Light</button>
           <button data-theme-set="dark" class="theme-btn dark-btn">Dark</button>
@@ -346,6 +362,11 @@ def _detail(novel: dict | None) -> str:
           <a class="action-btn continue-btn" href="/reader/?novel_id={novel_id}" title="{read_label}">
             {continue_icon}
           </a>
+          
+          <!-- Chat with characters button -->
+          <a class="action-btn chat-action-btn" href="/chat/?novel_id={novel_id}" title="Chat with characters">
+            {CHAT_ICON_SVG}
+          </a>
         </div>
         
         <div class="modal-divider"></div>
@@ -520,6 +541,7 @@ def _top(novel: dict, section: dict | None, state: dict) -> str:
       <div><small>{_escape(novel['title'])}</small><strong>{_escape(title)}</strong></div>
       <nav>
         <a href="/dashboard/">Dashboard</a>
+        <a class="chat-trigger" href="/chat/?novel_id={novel['id']}" title="Chat with characters">{CHAT_ICON_SVG}</a>
         <button class="speaker-trigger" title="Read aloud" data-tts-novel="{novel['id']}" data-tts-section="{cur_section}">
           <svg class="speaker-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">
             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
@@ -1313,6 +1335,23 @@ function closeModal() {
     btn.click();
   }
 }
+
+function openUploadModal() {
+  var m = document.getElementById('upload-modal');
+  if (m) m.classList.add('show');
+}
+
+function closeUploadModal() {
+  var m = document.getElementById('upload-modal');
+  if (m) m.classList.remove('show');
+}
+
+document.addEventListener('click', function(e) {
+  var overlay = document.getElementById('upload-modal');
+  if (overlay && overlay.classList.contains('show') && e.target === overlay) {
+    closeUploadModal();
+  }
+});
 """
 
 CSS = """
@@ -1406,6 +1445,8 @@ footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn
 .dashboard-theme-selector { display:flex; gap:8px; align-items:center; }
 .dashboard-theme-selector button { border:1px solid var(--line)!important; background:transparent!important; border-radius:6px!important; color:var(--ink)!important; box-shadow:none!important; text-decoration:none; padding:7px 14px; cursor:pointer; font-size:13px; font-weight:500; transition:all .2s; }
 .dashboard-theme-selector button:hover { background:var(--line)!important; }
+.dashboard-theme-selector .upload-btn-trigger { background:var(--blue)!important; border-color:var(--blue)!important; color:#fff!important; font-weight:600; margin-right:4px; }
+.dashboard-theme-selector .upload-btn-trigger:hover { filter:brightness(1.08); background:var(--blue)!important; }
 .dashboard h2 { margin:36px 0 12px; font-size:14px; color:var(--muted); text-transform:uppercase; }
 .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:24px 18px; }
 
@@ -1439,6 +1480,26 @@ footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn
 
 /* ── Modal Dialog ──────────────────────────────────────────────────── */
 .modal-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0, 0, 0, 0.4); display:none; align-items:center; justify-content:center; z-index:99999; padding:20px; box-sizing:border-box; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); animation:fadeIn 0.25s ease-out; }
+.modal-overlay.show { display:flex; }
+
+/* ── Upload Modal ──────────────────────────────────────────────────── */
+.upload-modal-overlay { position:fixed!important; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.4)!important; display:none!important; align-items:center!important; justify-content:center!important; z-index:99999!important; padding:20px; box-sizing:border-box; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+.upload-modal-overlay.show { display:flex!important; }
+.upload-modal-card { background:var(--paper)!important; color:var(--ink)!important; width:100%!important; max-width:460px!important; border-radius:20px!important; box-shadow:0 20px 50px rgba(0,0,0,0.3)!important; border:1px solid var(--line)!important; box-sizing:border-box; padding:24px 24px 22px!important; gap:14px!important; animation:slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); flex:0 0 auto!important; }
+.upload-modal-head { display:flex; align-items:center; justify-content:space-between; }
+.upload-modal-head h3 { margin:0; font:400 22px/1.2 Georgia,serif; color:var(--ink); }
+.upload-modal-close { border:none; background:rgba(0,0,0,0.04); color:var(--ink); width:32px; height:32px; border-radius:50%; font-size:24px; line-height:1; font-weight:300; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.2s; }
+.upload-modal-close:hover { background:var(--line); transform:scale(1.05); }
+.upload-modal-hint { margin:0; font-size:12px; color:var(--muted); text-align:center; }
+/* Dropzone styling — make the Gradio file widget readable in every theme */
+.upload-dropzone { background:transparent!important; border:none!important; }
+.upload-dropzone .upload-container, .upload-dropzone .file-upload { background:var(--card-bg)!important; border:2px dashed var(--line)!important; border-radius:14px!important; color:var(--ink)!important; min-height:170px!important; transition:border-color .2s,background .2s; }
+.upload-dropzone .upload-container:hover, .upload-dropzone .file-upload:hover, .upload-dropzone .drag { border-color:var(--blue)!important; background:var(--card-hover)!important; }
+.upload-dropzone .wrap, .upload-dropzone .wrap *, .upload-dropzone .upload-container *, .upload-dropzone .file-upload * { color:var(--ink)!important; }
+.upload-dropzone .wrap { background:transparent!important; }
+.upload-dropzone label, .upload-dropzone .label-wrap, .upload-dropzone .label-wrap *, .upload-dropzone span[data-testid="block-info"], .upload-dropzone .block-label, .upload-dropzone .block-label * { color:var(--ink)!important; }
+.upload-dropzone label, .upload-dropzone .label-wrap, .upload-dropzone .block-label { background:transparent!important; border:none!important; box-shadow:none!important; }
+.upload-dropzone .icon-wrap svg, .upload-dropzone .upload-icon { color:var(--blue)!important; opacity:0.85; }
 .modal-overlay.show { display:flex; }
 
 .modal-content { background:var(--paper); color:var(--ink); width:100%; max-width:520px; border-radius:20px; box-shadow:0 20px 50px rgba(0,0,0,0.3); border:1px solid var(--line); position:relative; box-sizing:border-box; padding:36px 32px 28px; text-align:center; max-height:90vh; overflow-y:auto; animation:slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
@@ -1495,6 +1556,11 @@ footer, .footer, .gradio-button.theme-toggle, button.theme-toggle, .settings-btn
 .continue-btn .icon-svg { stroke:none!important; color:#ffffff!important; }
 .continue-btn .icon-svg path { fill:#ffffff!important; stroke:none!important; }
 .continue-btn:hover { background:var(--blue)!important; opacity:0.95!important; }
+
+/* Chat Button (modal) */
+.chat-action-btn svg { width:24px!important; height:24px!important; stroke:var(--ink)!important; }
+.chat-action-btn:hover { border-color:var(--blue)!important; background:rgba(47,128,237,0.15)!important; }
+.chat-action-btn:hover svg { stroke:var(--blue)!important; }
 
 .modal-divider { height:1px; background:var(--line); width:100%; margin-bottom:24px; }
 
@@ -1778,6 +1844,23 @@ READER_CSS = CSS + """
 .speaker-trigger.loading .speaker-icon { animation: ttsPulse 1s ease-in-out infinite; }
 @keyframes ttsPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
+/* Chat entry button in the reader top bar */
+.chat-trigger {
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 50% !important;
+  padding: 0 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border: 1.5px solid var(--reader-line) !important;
+  background: transparent !important;
+  color: var(--reader-ink) !important;
+}
+.chat-trigger svg { display: block; width: 20px; height: 20px; stroke: var(--reader-ink) !important; }
+.chat-trigger:hover { border-color: var(--blue) !important; }
+.chat-trigger:hover svg { stroke: var(--blue) !important; }
+
 /* Spoken-entry highlight, painted via the CSS Custom Highlight API while
    reading aloud. Non-destructive: the chapter's own HTML is never modified. */
 ::highlight(tts-active) {
@@ -1853,3 +1936,437 @@ READER_CSS = CSS + """
   color: #eb5e55 !important;
 }
 """
+
+
+# ── In-character chat ────────────────────────────────────────────────────────
+
+# Reused chat-bubble icon for the reader top bar + dashboard modal entry points.
+CHAT_ICON_SVG = (
+    "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' "
+    "stroke-linecap='round' stroke-linejoin='round'>"
+    "<path d='M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'></path>"
+    "</svg>"
+)
+
+_SETTINGS_GEAR_SVG = (
+    "<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' "
+    "stroke-width='2' stroke-linecap='round' stroke-linejoin='round' style='display:block;'>"
+    "<circle cx='12' cy='12' r='3'></circle>"
+    "<path d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'></path>"
+    "</svg>"
+)
+
+
+def _chat_shell() -> str:
+    """Static chat shell; CHAT_JS reads novel_id from the URL and fills it in."""
+    return f"""
+    <div class="chat-app">
+      <aside class="chat-sidebar">
+        <div class="chat-sidebar-head">
+          <a class="rail-link" href="/dashboard/">&larr; Dashboard</a>
+          <button class="sidebar-collapse" title="Collapse">&laquo;</button>
+        </div>
+        <div class="chat-sidebar-title">Characters</div>
+        <div class="chat-char-list"><div class="chat-empty-note">Loading…</div></div>
+      </aside>
+
+      <main class="chat-main">
+        <header class="chat-top">
+          <button class="sidebar-expand" title="Show characters">&#9776;</button>
+          <div class="chat-top-info">
+            <small>Talking with</small>
+            <strong class="chat-current-name">Select a character</strong>
+          </div>
+          <nav>
+            <a class="chat-reader-link" href="/dashboard/">Reader</a>
+            <button class="settings-trigger" title="Settings">{_SETTINGS_GEAR_SVG}</button>
+          </nav>
+        </header>
+
+        <div class="chat-transcript">
+          <div class="chat-placeholder">
+            <h2>Chat with the characters</h2>
+            <p>Pick someone from the list to start a conversation. They only know the story up to where you've read.</p>
+          </div>
+        </div>
+
+        <form class="chat-composer" autocomplete="off">
+          <textarea class="chat-input" rows="1" placeholder="Say something…" disabled></textarea>
+          <button type="submit" class="chat-send" title="Send" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+          </button>
+        </form>
+      </main>
+
+      <div class="settings-popover">
+        <div class="settings-group" style="border-bottom:none;margin-bottom:0;padding-bottom:0;">
+          <h4>Theme</h4>
+          <div class="settings-row themes">
+            <button class="theme-btn sepia" data-theme-set="sepia">Sepia</button>
+            <button class="theme-btn light" data-theme-set="light">Light</button>
+            <button class="theme-btn dark" data-theme-set="dark">Dark</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+
+
+def build_chat_app() -> gr.Blocks:
+    with gr.Blocks(title="Chat") as demo:
+        gr.HTML(_chat_shell())
+    return demo
+
+
+CHAT_JS = r"""
+(function() {
+  var t = localStorage.getItem('nr-theme') || 'sepia';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+
+const cq = (sel, root = document) => root.querySelector(sel);
+const cqa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+function chatNovelId() {
+  return new URLSearchParams(location.search).get('novel_id');
+}
+
+function applyTheme(name) {
+  localStorage.setItem('nr-theme', name);
+  document.documentElement.setAttribute('data-theme', name);
+  cqa('.settings-popover .theme-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.themeSet === name));
+}
+
+function roleLabel(role) {
+  if (!role) return '';
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function renderCharacters(list) {
+  const wrap = cq('.chat-char-list');
+  if (!wrap) return;
+  if (!list || !list.length) {
+    wrap.innerHTML = "<div class='chat-empty-note'>No characters available yet. Keep reading!</div>";
+    return;
+  }
+  wrap.innerHTML = list.map(c => {
+    const initial = (c.name || '?').trim().charAt(0).toUpperCase();
+    return `<button class="chat-char" data-id="${c.id}" data-name="${encodeURIComponent(c.name)}">
+      <span class="chat-char-avatar">${initial}</span>
+      <span class="chat-char-info">
+        <span class="chat-char-name"></span>
+        <span class="chat-char-role role-${c.role || 'minor'}">${roleLabel(c.role)}</span>
+      </span>
+    </button>`;
+  }).join('');
+  // Set names via textContent to avoid any HTML injection.
+  cqa('.chat-char', wrap).forEach((el, i) => {
+    cq('.chat-char-name', el).textContent = list[i].name;
+  });
+}
+
+async function loadCharacters() {
+  const id = chatNovelId();
+  if (!id) return;
+  try {
+    const r = await fetch(`/chat/characters?novel_id=${id}`);
+    const data = await r.json();
+    renderCharacters(data.characters || []);
+  } catch (e) {
+    const wrap = cq('.chat-char-list');
+    if (wrap) wrap.innerHTML = "<div class='chat-empty-note'>Chat is offline.</div>";
+  }
+}
+
+function appendMessage(role, text) {
+  const t = cq('.chat-transcript');
+  const placeholder = cq('.chat-placeholder');
+  if (placeholder) placeholder.remove();
+  const msg = document.createElement('div');
+  msg.className = `chat-msg ${role}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble';
+  bubble.textContent = text;
+  msg.appendChild(bubble);
+  t.appendChild(msg);
+  t.scrollTop = t.scrollHeight;
+  return bubble;
+}
+
+function renderHistory(messages) {
+  const t = cq('.chat-transcript');
+  t.innerHTML = '';
+  if (!messages || !messages.length) {
+    const note = document.createElement('div');
+    note.className = 'chat-placeholder';
+    note.innerHTML = "<p>Say hello to start the conversation.</p>";
+    t.appendChild(note);
+    return;
+  }
+  messages.forEach(m => appendMessage(m.role === 'character' ? 'character' : 'user', m.content));
+}
+
+async function selectCharacter(el) {
+  cqa('.chat-char').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  const name = decodeURIComponent(el.dataset.name);
+  window.__chatCharId = el.dataset.id;
+  window.__chatCharName = name;
+  cq('.chat-current-name').textContent = name;
+  cq('.chat-input').disabled = false;
+  cq('.chat-send').disabled = false;
+  cq('.chat-input').focus();
+  // Collapse sidebar on small screens after picking.
+  if (window.innerWidth <= 860) cq('.chat-app').classList.add('sidebar-collapsed');
+
+  const id = chatNovelId();
+  const t = cq('.chat-transcript');
+  t.innerHTML = "<div class='chat-placeholder'><p>Loading…</p></div>";
+  try {
+    const r = await fetch(`/chat/history?novel_id=${id}&character_id=${window.__chatCharId}`);
+    const data = await r.json();
+    renderHistory(data.messages || []);
+  } catch (e) {
+    renderHistory([]);
+  }
+}
+
+async function sendMessage() {
+  const input = cq('.chat-input');
+  const text = (input.value || '').trim();
+  if (!text || !window.__chatCharId || window.__chatStreaming) return;
+  const id = chatNovelId();
+
+  input.value = '';
+  input.style.height = 'auto';
+  appendMessage('user', text);
+
+  const bubble = appendMessage('character', '');
+  bubble.parentElement.classList.add('streaming');
+  window.__chatStreaming = true;
+  cq('.chat-send').disabled = true;
+
+  try {
+    const resp = await fetch('/chat/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ novel_id: id, character_id: window.__chatCharId, message: text }),
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    const t = cq('.chat-transcript');
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bubble.textContent += decoder.decode(value, { stream: true });
+      t.scrollTop = t.scrollHeight;
+    }
+    if (!bubble.textContent) bubble.textContent = '…';
+  } catch (e) {
+    bubble.textContent = bubble.textContent || 'Sorry — something went wrong.';
+  } finally {
+    bubble.parentElement.classList.remove('streaming');
+    window.__chatStreaming = false;
+    cq('.chat-send').disabled = false;
+    input.focus();
+  }
+}
+
+function bootChat() {
+  if (window.__chatBooted) return;
+  const shell = cq('.chat-app');
+  if (!shell) return;
+  window.__chatBooted = true;
+
+  applyTheme(localStorage.getItem('nr-theme') || 'sepia');
+
+  // Point the Reader link at this novel.
+  const id = chatNovelId();
+  const rl = cq('.chat-reader-link');
+  if (rl && id) rl.setAttribute('href', `/reader/?novel_id=${id}`);
+
+  loadCharacters();
+
+  document.addEventListener('click', (e) => {
+    const charBtn = e.target.closest('.chat-char');
+    if (charBtn) { selectCharacter(charBtn); return; }
+
+    if (e.target.closest('.sidebar-collapse')) {
+      shell.classList.add('sidebar-collapsed'); return;
+    }
+    if (e.target.closest('.sidebar-expand')) {
+      shell.classList.remove('sidebar-collapsed'); return;
+    }
+
+    const trigger = e.target.closest('.settings-trigger');
+    const panel = cq('.settings-popover');
+    if (trigger) {
+      e.preventDefault();
+      panel.classList.toggle('show');
+      if (panel.classList.contains('show')) {
+        const rect = trigger.getBoundingClientRect();
+        panel.style.top = `${rect.bottom + 8}px`;
+        panel.style.left = `${Math.max(10, Math.min(innerWidth - 230, rect.left + rect.width - 200))}px`;
+      }
+      return;
+    }
+    const themeSet = e.target.closest('[data-theme-set]');
+    if (themeSet) { applyTheme(themeSet.dataset.themeSet); return; }
+    if (panel && panel.classList.contains('show') && !e.target.closest('.settings-popover')) {
+      panel.classList.remove('show');
+    }
+  });
+
+  document.addEventListener('submit', (e) => {
+    if (e.target.closest('.chat-composer')) { e.preventDefault(); sendMessage(); }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.closest('.chat-input') && e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault(); sendMessage();
+    }
+  });
+
+  // Auto-grow the composer textarea.
+  document.addEventListener('input', (e) => {
+    const input = e.target.closest('.chat-input');
+    if (input) { input.style.height = 'auto'; input.style.height = Math.min(160, input.scrollHeight) + 'px'; }
+  });
+}
+
+// Gradio mounts asynchronously; retry until the shell exists.
+const __chatBootTimer = setInterval(() => {
+  if (cq('.chat-app')) { clearInterval(__chatBootTimer); bootChat(); }
+}, 60);
+"""
+
+
+CHAT_CSS = CSS + """
+/* ── Chat layout ──────────────────────────────────────────────────────── */
+/* The chat fills the viewport exactly. Neutralise Gradio's wrapper padding /
+   gaps and lock page scroll so the 100vh app never overflows the screen
+   (which otherwise pushed the top bar / composer off-edge and added a page
+   scrollbar). Scoped to the /chat page only. */
+html, body { height:100%; overflow:hidden; }
+.gradio-container { height:100vh!important; overflow:hidden!important; }
+.gradio-container > .main,
+.gradio-container .main > .wrap,
+.gradio-container .contain,
+.gradio-container .contain > .gap,
+.gradio-container .html-container,
+.gradio-container .block {
+  padding:0!important; margin:0!important; gap:0!important;
+  max-width:none!important; border:none!important;
+}
+.gradio-container .contain > .gap > .block { height:100vh!important; }
+
+.chat-app { display:flex; flex-direction:row; height:100vh; width:100%; overflow:hidden; box-sizing:border-box; }
+
+.chat-sidebar {
+  flex:0 0 300px; width:300px; height:100vh; overflow-y:auto; overflow-x:hidden;
+  background:var(--paper); border-right:1px solid var(--line);
+  display:flex; flex-direction:column; box-sizing:border-box; transition:margin-left .25s ease;
+}
+.chat-app.sidebar-collapsed .chat-sidebar { margin-left:-301px; }
+.chat-sidebar-head { display:flex; align-items:center; justify-content:space-between; padding:16px 18px 8px; }
+.chat-sidebar-head .rail-link { margin:0; color:var(--ink)!important; font-size:13px; }
+.sidebar-collapse, .sidebar-expand {
+  border:1px solid var(--line)!important; background:transparent!important; color:var(--ink)!important;
+  border-radius:6px!important; width:30px; height:30px; cursor:pointer; font-size:15px; line-height:1;
+  display:inline-flex; align-items:center; justify-content:center; padding:0!important;
+}
+.sidebar-expand { display:none; }
+.chat-app.sidebar-collapsed .sidebar-expand { display:inline-flex; }
+.chat-sidebar-title { padding:8px 18px; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
+.chat-char-list { display:flex; flex-direction:column; padding:4px 10px 18px; gap:4px; }
+.chat-empty-note { color:var(--muted); font-size:13px; padding:14px 8px; text-align:center; }
+
+.chat-char {
+  display:flex; align-items:center; gap:12px; width:100%; text-align:left; cursor:pointer;
+  background:transparent!important; border:1px solid transparent!important; border-radius:10px!important;
+  padding:10px 12px!important; transition:all .15s ease; color:var(--ink)!important;
+}
+.chat-char:hover { background:var(--card-bg)!important; border-color:var(--line)!important; }
+.chat-char.active { background:var(--card-hover)!important; border-color:var(--blue)!important; }
+.chat-char-avatar {
+  flex:0 0 38px; width:38px; height:38px; border-radius:50%; background:var(--blue); color:#fff;
+  display:flex; align-items:center; justify-content:center; font:600 16px/1 Georgia,serif;
+}
+.chat-char-info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.chat-char-name { font:500 15px/1.2 Georgia,serif; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.chat-char-role { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
+.chat-char-role.role-protagonist, .chat-char-role.role-deuteragonist { color:var(--blue); font-weight:600; }
+.chat-char-role.role-antagonist { color:var(--warn); font-weight:600; }
+
+.chat-main { flex:1; min-width:0; height:100vh; display:flex; flex-direction:column; background:var(--bg); }
+.chat-top {
+  flex:0 0 auto; height:64px; display:flex; align-items:center; gap:14px; padding:0 22px;
+  border-bottom:1px solid var(--line); background:var(--paper);
+}
+.chat-top-info { display:flex; flex-direction:column; flex:1; min-width:0; }
+.chat-top-info small { color:var(--muted); font-size:11px; }
+.chat-top-info strong { font:400 19px/1.15 Georgia,serif; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.chat-top nav { display:flex; gap:8px; align-items:center; }
+.chat-top nav a { border:1px solid var(--line)!important; background:transparent!important; color:var(--ink)!important; border-radius:6px; text-decoration:none; padding:7px 12px; font-size:13px; }
+
+.chat-transcript { flex:1; overflow-y:auto; padding:26px clamp(16px,6vw,90px); display:flex; flex-direction:column; gap:14px; }
+.chat-placeholder { margin:auto; text-align:center; color:var(--muted); max-width:420px; }
+.chat-placeholder h2 { font:400 26px/1.2 Georgia,serif; color:var(--ink); margin:0 0 10px; }
+.chat-placeholder p { font-size:15px; line-height:1.5; }
+
+.chat-msg { display:flex; max-width:76%; }
+.chat-msg.user { align-self:flex-end; }
+.chat-msg.character { align-self:flex-start; }
+.chat-bubble {
+  padding:12px 16px; border-radius:16px; font:16px/1.45 Georgia,serif; white-space:pre-wrap;
+  word-wrap:break-word; box-shadow:0 1px 3px rgba(0,0,0,.06);
+}
+.chat-msg.user .chat-bubble { background:var(--blue); color:#fff; border-bottom-right-radius:4px; }
+.chat-msg.character .chat-bubble { background:var(--paper); color:var(--ink); border:1px solid var(--line); border-bottom-left-radius:4px; }
+.chat-msg.streaming .chat-bubble::after { content:'▋'; color:var(--muted); animation:chatBlink 1s steps(2) infinite; }
+@keyframes chatBlink { 0%,100%{opacity:1;} 50%{opacity:0;} }
+
+.chat-composer { flex:0 0 auto; display:flex; gap:10px; align-items:flex-end; padding:14px clamp(16px,6vw,90px); border-top:1px solid var(--line); background:var(--paper); }
+.chat-input {
+  flex:1; resize:none; max-height:160px; min-height:44px; padding:11px 14px; border-radius:12px;
+  border:1px solid var(--line)!important; background:var(--bg)!important; color:var(--ink)!important;
+  font:15px/1.4 Inter,system-ui,sans-serif; box-sizing:border-box; outline:none;
+}
+.chat-input:focus { border-color:var(--blue)!important; }
+.chat-send {
+  flex:0 0 auto; width:44px; height:44px; border-radius:50%!important; border:none!important;
+  background:var(--blue)!important; color:#fff!important; cursor:pointer; display:inline-flex;
+  align-items:center; justify-content:center; padding:0!important;
+}
+.chat-send:disabled { opacity:.5; cursor:not-allowed; }
+
+/* Settings popover (theme switch) — shared look with the reader. */
+.settings-popover {
+  position:fixed!important; z-index:1000; display:none; width:220px; background:var(--paper)!important;
+  color:var(--ink)!important; border:1px solid var(--line)!important; border-radius:14px!important;
+  box-shadow:0 12px 36px rgba(0,0,0,.18)!important; padding:18px!important; box-sizing:border-box!important;
+}
+.settings-popover.show { display:block!important; }
+.settings-popover h4 { margin:0 0 10px!important; color:var(--muted)!important; font-size:11px!important; text-transform:uppercase!important; letter-spacing:.5px!important; }
+.settings-row.themes { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+.settings-popover .theme-btn {
+  background:var(--bg)!important; color:var(--ink)!important; border:1.5px solid var(--line)!important;
+  border-radius:8px!important; padding:8px 6px!important; cursor:pointer!important; font-size:13px!important;
+  font-weight:500!important; text-align:center!important; width:100%!important; box-sizing:border-box!important;
+}
+.settings-popover .theme-btn.active { background:var(--blue)!important; color:#fff!important; border-color:var(--blue)!important; }
+.settings-trigger {
+  width:36px!important; height:36px!important; border-radius:50%!important; padding:0!important;
+  display:inline-flex!important; align-items:center!important; justify-content:center!important; cursor:pointer!important;
+  border:1.5px solid var(--line)!important; background:transparent!important; color:var(--ink)!important;
+}
+.settings-trigger svg { display:block; stroke:var(--ink)!important; color:var(--ink)!important; }
+
+@media (max-width:860px) {
+  .chat-sidebar { position:fixed; z-index:200; top:0; left:0; box-shadow:0 0 40px rgba(0,0,0,.3); }
+  .chat-app.sidebar-collapsed .chat-sidebar { margin-left:-301px; }
+  .chat-msg { max-width:90%; }
+}
+"""
+

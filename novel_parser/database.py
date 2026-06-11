@@ -169,6 +169,26 @@ CREATE TABLE IF NOT EXISTS pass1_extractions (
     UNIQUE(novel_meta_id, section_index)
 );
 
+-- In-character chat: one session per (novel, character)
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id              SERIAL PRIMARY KEY,
+    novel_meta_id   INTEGER NOT NULL REFERENCES novels_meta(id) ON DELETE CASCADE,
+    character_id    INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    rolling_summary TEXT NOT NULL DEFAULT '',
+    summary_upto_id INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(novel_meta_id, character_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id              SERIAL PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_characters_novel ON characters(novel_meta_id);
 CREATE INDEX IF NOT EXISTS idx_characters_series ON characters(series_id);
@@ -176,6 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_dialogue_novel_section ON dialogue_entries(novel_
 CREATE INDEX IF NOT EXISTS idx_events_novel_section ON novel_events(novel_meta_id, section_index);
 CREATE INDEX IF NOT EXISTS idx_profiles_character ON character_profiles(character_id);
 CREATE INDEX IF NOT EXISTS idx_series_novels_series ON series_novels(series_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_novel ON chat_sessions(novel_meta_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);
 """
 
 
@@ -806,6 +828,87 @@ class DatabaseManager:
                 "SELECT * FROM novel_events WHERE id = ANY(%s) ORDER BY section_index, sequence_number",
                 (event_ids,),
             ).fetchall()
+
+    # ── in-character chat ──────────────────────────────────────────────────
+
+    def get_or_create_chat_session(
+        self, novel_meta_id: int, character_id: int
+    ) -> dict[str, Any]:
+        """Return the (novel, character) chat session, creating it if absent."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE novel_meta_id = %s AND character_id = %s",
+                (novel_meta_id, character_id),
+            ).fetchone()
+            if row:
+                return row
+            return conn.execute(
+                """
+                INSERT INTO chat_sessions (novel_meta_id, character_id)
+                VALUES (%s, %s)
+                RETURNING *
+                """,
+                (novel_meta_id, character_id),
+            ).fetchone()
+
+    def list_chat_sessions(self, novel_meta_id: int) -> list[dict[str, Any]]:
+        """All chat sessions for a novel, most recently active first."""
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM chat_sessions
+                WHERE novel_meta_id = %s
+                ORDER BY last_message_at DESC
+                """,
+                (novel_meta_id,),
+            ).fetchall()
+
+    def add_chat_message(self, session_id: int, role: str, content: str) -> int:
+        """Append a message and bump the session's last-active timestamp."""
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO chat_messages (session_id, role, content)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (session_id, role, content),
+            ).fetchone()
+            conn.execute(
+                "UPDATE chat_sessions SET last_message_at = NOW() WHERE id = %s",
+                (session_id,),
+            )
+            return int(row["id"])  # type: ignore[index]
+
+    def get_chat_messages(
+        self, session_id: int, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Messages for a session in chronological order (oldest first)."""
+        with self.connection() as conn:
+            if limit is None:
+                return conn.execute(
+                    "SELECT * FROM chat_messages WHERE session_id = %s ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            return conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM chat_messages WHERE session_id = %s
+                    ORDER BY id DESC LIMIT %s
+                ) t ORDER BY id
+                """,
+                (session_id, limit),
+            ).fetchall()
+
+    def update_session_summary(
+        self, session_id: int, summary: str, upto_id: int
+    ) -> None:
+        """Store the rolling summary and advance the verbatim watermark."""
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET rolling_summary = %s, summary_upto_id = %s WHERE id = %s",
+                (summary, upto_id, session_id),
+            )
 
     # ── voice actors ───────────────────────────────────────────────────────
 

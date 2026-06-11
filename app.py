@@ -10,7 +10,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from novel_reader.ui import CSS, READER_CSS, READER_JS, THEME_JS, build_dashboard_app, build_reader_app
+from novel_reader.ui import CSS, READER_CSS, READER_JS, THEME_JS, CHAT_CSS, CHAT_JS, build_dashboard_app, build_reader_app, build_chat_app
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +138,44 @@ def tts_progress(novel_id: int = Query(...), section: int = Query(...)):
     return JSONResponse({"status": "ok"})
 
 
+# ── In-character chat routes ────────────────────────────────────────────────
+from fastapi import Body
+from fastapi.responses import StreamingResponse
+
+from novel_reader.chat import ChatOrchestrator
+
+_chat = ChatOrchestrator()
+
+
+@app.get("/chat/characters")
+def chat_characters(novel_id: int = Query(...)):
+    """Spoiler-safe character list for the chat sidebar."""
+    return JSONResponse({"characters": _chat.list_characters(novel_id)})
+
+
+@app.get("/chat/history")
+def chat_history(novel_id: int = Query(...), character_id: int = Query(...)):
+    """Full transcript for a (novel, character) pair."""
+    return JSONResponse({"messages": _chat.get_history(novel_id, character_id)})
+
+
+@app.post("/chat/send")
+def chat_send(payload: dict = Body(...)):
+    """Stream the character's reply as plain-text chunks (SSE-style)."""
+    novel_id = int(payload.get("novel_id"))
+    character_id = int(payload.get("character_id"))
+    message = str(payload.get("message", ""))
+
+    def _stream():
+        for piece in _chat.answer_stream(novel_id, character_id, message):
+            yield piece
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
+
+
 gr.mount_gradio_app(app, build_dashboard_app().queue(default_concurrency_limit=4), path="/dashboard", css=CSS, js=THEME_JS, theme=gr.themes.Base())
 gr.mount_gradio_app(app, build_reader_app().queue(default_concurrency_limit=4), path="/reader", css=READER_CSS, js=READER_JS, theme=gr.themes.Base())
+gr.mount_gradio_app(app, build_chat_app().queue(default_concurrency_limit=4), path="/chat", css=CHAT_CSS, js=CHAT_JS, theme=gr.themes.Base())
 
 
 if __name__ == "__main__":
