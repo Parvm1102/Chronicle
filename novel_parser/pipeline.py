@@ -146,6 +146,11 @@ class NovelParsingPipeline:
 
         rag_settings = get_rag_settings()
         if not rag_settings.enable_rag_indexing:
+            logger.warning(
+                "Pipeline: Pass 3 (RAG indexing) SKIPPED for %s — "
+                "ENABLE_RAG_INDEXING is not 'true'. Set it to enable Qdrant indexing.",
+                novel_uuid,
+            )
             return
 
         # Series context: standalone defaults to the novel acting as its own series.
@@ -174,7 +179,17 @@ class NovelParsingPipeline:
             )
             logger.info("Pipeline: Pass 3 indexed %d chunks for %s", count, novel_uuid)
         except Exception as exc:
-            logger.warning("Pipeline: Pass 3 (RAG indexing) failed for %s: %s", novel_uuid, exc)
+            logger.error(
+                "Pipeline: Pass 3 (RAG indexing) FAILED for %s: %s",
+                novel_uuid, exc, exc_info=True,
+            )
+            try:
+                self._db.set_parse_status(
+                    novel_meta_id, "complete",
+                    f"Parsing complete (vector indexing failed: {exc})",
+                )
+            except Exception:
+                pass
 
     def resume(
         self,

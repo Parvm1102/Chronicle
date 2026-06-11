@@ -66,6 +66,11 @@ class TTSEngine:
         # A single lock guards both model loading and generation: the underlying
         # torch model is not thread-safe and the GPU serialises work anyway.
         self._lock = threading.Lock()
+        # Per-cache-key locks so two concurrent requests for the *same* line
+        # (e.g. the prefetch worker and the on-demand audio fetch racing) don't
+        # both generate it — the second waits and reads the first's cached wav.
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks_guard = threading.Lock()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -118,6 +123,15 @@ class TTSEngine:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def _get_key_lock(self, key: str) -> threading.Lock:
+        """Return a stable per-cache-key lock, creating it on first use."""
+        with self._key_locks_guard:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[key] = lock
+            return lock
+
     def _ensure_conditionals(self, voice_ref: str, voice_path: Path) -> None:
         """Prepare (and cache) speaker conditionals for a voice reference."""
         cached = self._conds_cache.get(voice_ref)
@@ -159,31 +173,38 @@ class TTSEngine:
         if out_path.exists():
             return out_path.read_bytes()
 
-        voice_path = self._resolve_voice(voice_ref)
-        self.load()
+        # Serialise concurrent requests for the *same* line: the first generates
+        # and writes the wav; the rest fall through to the cache hit below.
+        key_lock = self._get_key_lock(key)
+        with key_lock:
+            if out_path.exists():
+                return out_path.read_bytes()
 
-        import soundfile as sf
+            voice_path = self._resolve_voice(voice_ref)
+            self.load()
 
-        with self._lock:
-            self._ensure_conditionals(voice_ref, voice_path)
-            wav = self._model.generate(
-                text,
-                audio_prompt_path=None,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-            )
+            import soundfile as sf
 
-        data = wav.squeeze(0).detach().cpu().numpy()
-        buf = io.BytesIO()
-        sf.write(buf, data, self.sample_rate, format="WAV", subtype="PCM_16")
-        audio = buf.getvalue()
+            with self._lock:
+                self._ensure_conditionals(voice_ref, voice_path)
+                wav = self._model.generate(
+                    text,
+                    audio_prompt_path=None,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                )
 
-        tmp_path = out_path.with_suffix(".wav.tmp")
-        tmp_path.write_bytes(audio)
-        tmp_path.replace(out_path)  # atomic publish so prefetch readers never see a partial file
-        return audio
+            data = wav.squeeze(0).detach().cpu().numpy()
+            buf = io.BytesIO()
+            sf.write(buf, data, self.sample_rate, format="WAV", subtype="PCM_16")
+            audio = buf.getvalue()
+
+            tmp_path = out_path.with_suffix(".wav.tmp")
+            tmp_path.write_bytes(audio)
+            tmp_path.replace(out_path)  # atomic publish so prefetch readers never see a partial file
+            return audio
 
 
 # Process-global singleton so the FastAPI server and the Modal entrypoint share

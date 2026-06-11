@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
 import uuid
@@ -10,6 +11,21 @@ from typing import Any, Iterator
 
 from .config import DATABASE_PATH, NOVELS_DIR, ensure_app_dirs
 from .models import ParsedBook
+
+logger = logging.getLogger(__name__)
+
+# Titles that must never be deleted (kept as permanent demo content). Matched
+# as case-insensitive substrings so subtitles (e.g. "The Invisible Man: A
+# Grotesque Romance") still count as protected.
+PROTECTED_TITLE_SUBSTRINGS = ("invisible man",)
+
+
+def is_protected_novel(novel: dict | None) -> bool:
+    """Return True if the novel is a permanent demo book that cannot be deleted."""
+    if not novel:
+        return False
+    title = str(novel.get("title") or "").strip().lower()
+    return any(sub in title for sub in PROTECTED_TITLE_SUBSTRINGS)
 
 
 def utc_now() -> str:
@@ -357,8 +373,17 @@ class LibraryStore:
                 )
 
 
-    def delete_novel(self, novel_id: int) -> None:
+    def delete_novel(self, novel_id: int) -> list[str]:
+        """Delete a novel from SQLite, PostgreSQL, Qdrant, and disk.
+
+        Returns a list of non-fatal warning messages (e.g. external store
+        cleanup failures). Raises ``PermissionError`` for protected demo novels.
+        """
         novel = self.get_novel(novel_id)
+        if is_protected_novel(novel):
+            raise PermissionError("This book is protected and cannot be deleted.")
+
+        warnings: list[str] = []
         with self.connect() as conn:
             conn.execute("DELETE FROM dictionary_lookups WHERE novel_id = ?", (novel_id,))
             conn.execute("DELETE FROM highlights WHERE novel_id = ?", (novel_id,))
@@ -372,11 +397,13 @@ class LibraryStore:
                 from novel_parser.database import DatabaseManager
                 settings = get_settings()
                 db = DatabaseManager(settings)
-                db.delete_novel_meta(novel["uuid"])
-                db.close()
+                try:
+                    db.delete_novel_meta(novel["uuid"])
+                finally:
+                    db.close()
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Failed to delete novel from PostgreSQL: %s", e)
+                logger.warning("Failed to delete novel from PostgreSQL: %s", e, exc_info=True)
+                warnings.append(f"PostgreSQL cleanup failed: {e}")
 
             try:
                 from novel_rag.client import delete_novel_points
@@ -384,12 +411,13 @@ class LibraryStore:
             except ImportError:
                 pass
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Failed to delete novel from Qdrant: %s", e)
+                logger.warning("Failed to delete novel from Qdrant: %s", e, exc_info=True)
+                warnings.append(f"Qdrant cleanup failed: {e}")
 
             novel_dir = Path(str(novel["stored_path"])).parent.parent
             if novel_dir.exists() and novel_dir.parent == NOVELS_DIR:
                 shutil.rmtree(novel_dir)
+        return warnings
 
     def update_progress(self, novel_id: int, section_index: int) -> None:
         now = utc_now()

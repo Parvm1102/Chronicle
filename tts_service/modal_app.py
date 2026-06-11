@@ -19,6 +19,8 @@ Notes / things you may want to tweak at deploy time:
 
 from __future__ import annotations
 
+import os
+
 import modal
 
 # Upstream Chatterbox pinned to the exact commit chatterbox-trying/ tracks.
@@ -56,14 +58,37 @@ app = modal.App("novel-reader-tts")
 hf_cache = modal.Volume.from_name("novel-reader-hf-cache", create_if_missing=True)
 tts_cache = modal.Volume.from_name("novel-reader-tts-cache", create_if_missing=True)
 
+# Number of containers to keep permanently warm. Read at deploy time.
+#   0 (default) → scale-to-zero: you pay only while actually generating audio.
+#       The very first request after an idle period pays a cold start (model
+#       reload), but `scaledown_window` keeps the GPU warm between lines during
+#       a reading session, and the app's local wav cache means replays never
+#       hit Modal at all.
+#   1 → one GPU stays running 24/7 (billed continuously even when idle). Use
+#       this only for a live demo where the first line must also be instant;
+#       set TTS_MIN_CONTAINERS=1 before `modal deploy`, then back to 0 after.
+_MIN_CONTAINERS = int(os.environ.get("TTS_MIN_CONTAINERS", "0"))
+
 
 @app.cls(
     image=image,
     gpu="T4",
     volumes={"/root/.cache/huggingface": hf_cache, "/cache": tts_cache},
-    scaledown_window=300,
+    # Optional always-warm floor (see _MIN_CONTAINERS above). Default 0 so an
+    # idle service costs nothing.
+    min_containers=_MIN_CONTAINERS,
+    # Pin to a single container. The on-disk wav cache lives on a Modal Volume,
+    # and Volume writes are NOT shared live across containers — a second
+    # container would see an empty cache and regenerate everything. One container
+    # keeps the cache coherent (and the GPU serialises generation anyway, so
+    # extra containers buy no real speed-up for a single reader).
+    max_containers=1,
+    # Stay warm for 10 min after the last request so gaps between lines/chapters
+    # within a session don't trigger a model reload.
+    scaledown_window=600,
     timeout=600,
 )
+@modal.concurrent(max_inputs=8)
 class TTSService:
     @modal.enter()
     def _load(self) -> None:

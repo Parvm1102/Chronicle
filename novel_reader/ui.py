@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 import gradio as gr
 
 from .ingestion import IngestionPipeline
-from .storage import LibraryStore
+from .storage import LibraryStore, is_protected_novel
 
 
 store = LibraryStore()
@@ -141,10 +141,15 @@ def _toggle_archive(novel_id):
 
 def _delete(novel_id):
     novel_id = _int(novel_id)
-    if novel_id:
-        store.delete_novel(novel_id)
-        return _dashboard_outputs(None, "Book deleted.")
-    return _dashboard_outputs(None, "Choose a book first.", "warn")
+    if not novel_id:
+        return _dashboard_outputs(None, "Choose a book first.", "warn")
+    try:
+        warnings = store.delete_novel(novel_id)
+    except PermissionError as exc:
+        return _dashboard_outputs(novel_id, str(exc), "warn")
+    if warnings:
+        return _dashboard_outputs(None, "Book deleted, but: " + "; ".join(warnings), "warn")
+    return _dashboard_outputs(None, "Book deleted.")
 
 
 def _dashboard_select(request: gr.Request):
@@ -333,6 +338,15 @@ def _detail(novel: dict | None) -> str:
     archived_class = "active" if archived else ""
     read_label = "Read Again" if archived else "Continue Reading"
     
+    delete_button_html = ""
+    if not is_protected_novel(novel):
+        delete_button_html = f"""
+          <!-- Delete button -->
+          <button class="action-btn delete-btn" onclick="if(confirm('Are you sure you want to delete this book?')) document.getElementById('action-delete').click();" title="Delete Book">
+            {delete_icon}
+          </button>
+          """
+    
     return f"""
     <div id="detail-modal" class="modal-overlay show" onclick="if(event.target === this) closeModal();">
       <div class="modal-content">
@@ -355,10 +369,7 @@ def _detail(novel: dict | None) -> str:
             {archive_icon}
           </button>
           
-          <!-- Delete button -->
-          <button class="action-btn delete-btn" onclick="if(confirm('Are you sure you want to delete this book?')) document.getElementById('action-delete').click();" title="Delete Book">
-            {delete_icon}
-          </button>
+          {delete_button_html}
           
           <!-- Continue reading button -->
           <a class="action-btn continue-btn" href="/reader/?novel_id={novel_id}" title="{read_label}">

@@ -17,6 +17,7 @@ DB layer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import (
+    TTS_CACHE_DIR,
     TTS_DEFAULT_NARRATOR_ACTOR,
     TTS_LOOKAHEAD,
     TTS_MAX_CHARS,
@@ -124,28 +126,84 @@ _SYNTH_PARAMS: dict[str, Any] = {
 
 
 class TTSClient:
-    """Minimal HTTP client for the TTS microservice (stdlib only)."""
+    """Minimal HTTP client for the TTS microservice (stdlib only).
 
-    def __init__(self, base_url: str = TTS_SERVICE_URL, timeout: float = 120.0) -> None:
+    Every synthesized wav is cached on the *local* disk (``TTS_CACHE_DIR``) keyed
+    by ``sha256(text + voice_ref + params)``. Once a line has been fetched once,
+    it is served from local disk and never round-trips to the remote service
+    again — so repeat plays are instant and the wavs are available offline. This
+    is independent of any cache the service itself keeps.
+    """
+
+    def __init__(
+        self,
+        base_url: str = TTS_SERVICE_URL,
+        timeout: float = 120.0,
+        cache_dir: Path = TTS_CACHE_DIR,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Per-cache-key locks so the prefetch worker and an on-demand request
+        # racing for the same line don't both hit the network — the second waits
+        # and reads the first's cached wav.
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks_guard = threading.Lock()
+
+    @staticmethod
+    def _cache_key(text: str, voice_ref: str) -> str:
+        payload = json.dumps(
+            {"text": text, "voice_ref": voice_ref, "params": _SYNTH_PARAMS},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _key_lock(self, key: str) -> threading.Lock:
+        with self._key_locks_guard:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[key] = lock
+            return lock
 
     def health(self) -> dict:
         with urllib.request.urlopen(f"{self.base_url}/health", timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def is_cached(self, text: str, voice_ref: str) -> bool:
+        """True if this line is already on local disk (no network needed)."""
+        return (self.cache_dir / f"{self._cache_key(text, voice_ref)}.wav").exists()
+
     def synthesize(self, text: str, voice_ref: str) -> bytes:
-        payload = json.dumps({"text": text, "voice_ref": voice_ref, **_SYNTH_PARAMS}).encode(
-            "utf-8"
-        )
-        req = urllib.request.Request(
-            f"{self.base_url}/synthesize",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return resp.read()
+        key = self._cache_key(text, voice_ref)
+        out_path = self.cache_dir / f"{key}.wav"
+        if out_path.exists():
+            return out_path.read_bytes()
+
+        # Serialise concurrent requests for the same line through one network call.
+        with self._key_lock(key):
+            if out_path.exists():
+                return out_path.read_bytes()
+
+            payload = json.dumps(
+                {"text": text, "voice_ref": voice_ref, **_SYNTH_PARAMS}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/synthesize",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                audio = resp.read()
+
+            # Atomic publish so a concurrent reader never sees a partial file.
+            tmp_path = out_path.with_suffix(".wav.tmp")
+            tmp_path.write_bytes(audio)
+            tmp_path.replace(out_path)
+            return audio
 
 
 class TTSOrchestrator:
@@ -373,6 +431,9 @@ class TTSOrchestrator:
     def _synthesize_units(self, novel_id: int, section_index: int, units: list[dict]) -> None:
         """Synthesize a list of units, skipping ones already cached/in-flight."""
         for unit in units:
+            # Already on local disk → nothing to do (no network call).
+            if self._client.is_cached(unit["text"], unit["voice_ref"]):
+                continue
             key = (novel_id, section_index, unit["seq"])
             with self._lock:
                 if key in self._prefetched:
