@@ -1,3 +1,17 @@
+---
+title: Omniscient Novel Reader
+emoji: 📊
+colorFrom: indigo
+colorTo: yellow
+sdk: gradio
+sdk_version: 6.8.0
+python_version: '3.12'
+app_file: app.py
+pinned: false
+license: mit
+short_description: Break the fourth wall with the Omniscient Novel Reader
+---
+
 # Novel Reader
 
 A self-hosted novel reader with a clean reading UI, automatic novel **parsing**
