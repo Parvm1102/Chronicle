@@ -179,8 +179,9 @@ gr.mount_gradio_app(app, build_chat_app().queue(default_concurrency_limit=4), pa
 
 
 if __name__ == "__main__":
-    # Hugging Face Spaces (gradio SDK) sets GRADIO_SERVER_PORT=7860 and expects
-    # the app to bind 0.0.0.0. Locally it falls back to 8060 on all interfaces.
+    # On Hugging Face Spaces (docker SDK) the Dockerfile sets
+    # GRADIO_SERVER_PORT=7860 and GRADIO_SERVER_NAME=0.0.0.0. Locally it falls
+    # back to 8060 on all interfaces.
     port = int(os.environ.get("PORT") or os.environ.get("GRADIO_SERVER_PORT") or 8060)
     host = os.environ.get("GRADIO_SERVER_NAME") or "0.0.0.0"
     uvicorn.run(app, host=host, port=port)
