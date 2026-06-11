@@ -21,16 +21,21 @@ from __future__ import annotations
 
 import modal
 
-CHATTERBOX_SRC = "chatterbox-trying/chatterbox"
+# Upstream Chatterbox pinned to the exact commit chatterbox-trying/ tracks.
+# Installed from git so no local copy of the source is needed at deploy time
+# (chatterbox-trying/ is gitignored).
+CHATTERBOX_GIT = (
+    "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git"
+    "@3f35dfc8fbe63e5b29793289dc68f1875bb317a5"
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "libsndfile1", "ffmpeg")
     .pip_install("fastapi>=0.110", "uvicorn[standard]>=0.29", "soundfile>=0.12")
-    # Bake the local Chatterbox source into the image and install it
+    # Install Chatterbox straight from upstream at the pinned commit
     # (pulls torch==2.6.0, transformers==5.2.0, … per its pyproject).
-    .add_local_dir(CHATTERBOX_SRC, "/opt/chatterbox", copy=True)
-    .run_commands("pip install --no-cache-dir /opt/chatterbox")
+    .pip_install(CHATTERBOX_GIT)
     # Bake voice samples so voice_ref resolution needs no runtime mount.
     .add_local_dir("voice_samples", "/voice_samples", copy=True)
     # Our service package.

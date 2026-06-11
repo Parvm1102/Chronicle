@@ -1,7 +1,8 @@
 # Chatterbox-Turbo TTS microservice (GPU).
 #
-# Build from the REPOSITORY ROOT so the build context can see both the
-# chatterbox source and tts_service/:
+# Chatterbox itself is installed from upstream git at a pinned commit, so the
+# build no longer needs the local chatterbox-trying/ source. Build from the
+# repository root so the context can see tts_service/ and voice_samples/:
 #
 #   docker build -f tts_service/Dockerfile -t novel-reader-tts .
 #
@@ -24,8 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install Chatterbox first (its pinned torch==2.6.0 matches the base image).
-COPY chatterbox-trying/chatterbox /app/chatterbox
-RUN pip install --no-cache-dir /app/chatterbox
+# Installed straight from upstream at a pinned commit so the build needs no
+# local copy of the chatterbox source (chatterbox-trying/ is gitignored and is
+# a clean, unmodified clone of this exact commit).
+RUN pip install --no-cache-dir \
+    "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@3f35dfc8fbe63e5b29793289dc68f1875bb317a5"
 
 # Thin web layer deps.
 COPY tts_service/requirements.txt /app/tts_service/requirements.txt
