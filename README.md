@@ -1,301 +1,117 @@
----
-title: Omniscient Novel Reader
-emoji: 📊
-colorFrom: indigo
-colorTo: yellow
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: Break the fourth wall with the Omniscient Novel Reader
----
 
-# Novel Reader
 
-A self-hosted novel reader with a clean reading UI, automatic novel **parsing**
-(character extraction, dialogue attribution, emotion tagging, voice-actor
-assignment), and per-character **text-to-speech narration** powered by
-Chatterbox-Turbo.
+<div align="center">
 
-The system is made of three cooperating pieces:
+<img src="public/light_theme.jpeg" alt="Omniscient Novel Reader logo" width="160" />
 
-| Component | Tech | Role |
-|-----------|------|------|
-| **Main app** (`app.py`, `novel_reader/`) | FastAPI + Gradio | Reading UI, library, ingestion, TTS orchestration |
-| **Parser** (`novel_parser/`) | PostgreSQL + LLM | Extracts characters, dialogue, emotions, assigns voices |
-| **TTS service** (`tts_service/`) | FastAPI + Chatterbox-Turbo (GPU) | Turns text + a voice sample into speech |
+# Chronicle
 
-The TTS service runs as a **separate container/process** because it has heavy,
-pinned ML dependencies (torch 2.6, transformers 5.2, …). The main app talks to
-it over HTTP, so you can run it locally now and move it to **Modal** later by
-only changing one URL.
+**Read any novel, hear every character, and talk to them — break the fourth wall.**
+
+Live: https://build-small-hackathon-omniscient-novel-reader.hf.space/dashboard/
+
+Demo Video: https://www.youtube.com/watch?v=6n9lhJjK10U
+
+</div>
 
 ---
+
+A self-hosted novel reader that turns a plain `.txt`, `.epub`, or `.pdf` into a
+rich, interactive experience. Upload a book and the system:
+
+- **Reads** it in a clean, distraction-free reader with progress, bookmarks, and auto-scroll.
+- **Parses** it with an LLM — extracting characters, attributing every line of dialogue, tagging emotions, and assigning each character a voice.
+- **Narrates** it with per-character text-to-speech (Chatterbox-Turbo), where each speaker has their own voice and emotion. Lines are highlighted as they play and prefetched for near real-time playback.
+- **Lets you chat** with any character — answers are grounded in a **spoiler-safe** retrieval layer that never reveals anything past your current chapter.
+
+## How to use it
+
+1. **Upload** a `.txt`, `.epub`, or `.pdf` from the dashboard.
+2. With parsing enabled, the book is analysed in the background (characters, dialogue, emotions, voice assignment).
+3. **Open** the book in the reader and start reading.
+4. Click the **speaker icon** to start narration — it auto-advances chapters, highlights the current line, and auto-scrolls.
+5. Open the **chat** to talk to any character in-universe, with no spoilers beyond where you've read.
+
+> See **[SETUP.md](SETUP.md)** for installation, configuration, and both Docker and cloud deployment instructions.
+
+## Technologies
+
+| Layer | Tech |
+|-------|------|
+| Web / UI | FastAPI, Gradio, vanilla-JS narration player |
+| Reader storage | SQLite (sections, progress, bookmarks) |
+| Parsing | LLM via Ollama / Groq / OpenRouter / Gemini |
+| Parsed data | PostgreSQL (or Supabase) |
+| RAG / chat | Qdrant + FastEmbed (ONNX hybrid dense + BM25, reranking) |
+| Narration | Chatterbox-Turbo TTS (GPU), deployable to Modal |
+| Infra | Docker Compose, optional NVIDIA Container Toolkit |
 
 ## Architecture
+
+The system is three cooperating pieces. The **TTS service** runs as a separate
+container/process because of its heavy, pinned ML dependencies (torch 2.6,
+transformers 5.2, …). The main app talks to it over HTTP, so it can run locally
+now and move to **Modal** later by changing only one URL.
 
 ```
                 ┌──────────────────────────────────────────────┐
    Browser ───► │  Main app  (FastAPI + Gradio)  :8060          │
                 │                                                │
-                │   /dashboard   /reader   /tts/*                │
-                │        │            │         │                │
-                │     SQLite      SQLite     Orchestrator        │
-                │   (library)   (sections)   (novel_reader/tts)  │
-                └──────────────────┬──────────────┬─────────────┘
-                                   │              │ HTTP
-                          ┌────────▼─────┐   ┌────▼──────────────┐
-                          │ PostgreSQL    │   │ TTS service :8070 │
-                          │ (parsed data) │   │ Chatterbox-Turbo  │
-                          └───────────────┘   │ (GPU)             │
-                                   ▲          └────────┬──────────┘
-                                   │                   │ reads
-                          ┌────────┴─────┐    ┌────────▼──────────┐
-                          │ novel_parser  │    │ voice_samples/    │
-                          │ (LLM passes)  │    │ *.wav references  │
-                          └───────────────┘    └───────────────────┘
+                │   /dashboard   /reader   /chat   /tts/*        │
+                │        │           │        │        │         │
+                │     SQLite      SQLite    RAG    Orchestrator   │
+                │   (library)   (sections) (Qdrant)  (tts.py)     │
+                └──────────┬───────────┬────────┬──────┬─────────┘
+                           │           │        │      │ HTTP
+                  ┌────────▼─────┐ ┌───▼────┐ ┌─▼────────────────┐
+                  │ PostgreSQL    │ │ Qdrant │ │ TTS service :8070 │
+                  │ (parsed data) │ │ (RAG)  │ │ Chatterbox-Turbo  │
+                  └───────┬───────┘ └────────┘ │ (GPU)             │
+                          ▲                     └────────┬─────────┘
+                  ┌───────┴──────┐              ┌────────▼─────────┐
+                  │ novel_parser  │              │ voice_samples/   │
+                  │ (LLM passes)  │              │ *.wav references │
+                  └───────────────┘              └──────────────────┘
 ```
 
-- **Reader data** (sections, reading progress, bookmarks) lives in SQLite at
-  `data/reader.sqlite3`.
-- **Parsed data** (characters, `dialogue_entries` with speaker/emotion/voice)
-  lives in **PostgreSQL**. The two are linked by the novel's `uuid`.
-- **TTS** consumes only `(text, voice_ref)` and returns a WAV — it never touches
-  either database.
+- **Reader data** (sections, progress, bookmarks) lives in SQLite at `data/reader.sqlite3`.
+- **Parsed data** (characters, dialogue with speaker/emotion/voice) lives in **PostgreSQL**, linked to the reader by the novel's `uuid`.
+- **RAG data** (chunked full text with spoiler metadata) lives in **Qdrant**.
+- **TTS** consumes only `(text, voice_ref)` and returns a WAV — it never touches the databases.
 
----
+## How it works
 
-## Prerequisites
-
-- **Python 3.10+** (the project venv uses 3.10.12)
-- **Docker + Docker Compose** (for PostgreSQL and the TTS service)
-- **An NVIDIA GPU + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)** — required for the TTS container (CPU works but is very slow)
-- **An LLM** for parsing — either a local [Ollama](https://ollama.com) or a cloud key (Groq / OpenRouter / Gemini). Parsing is **optional**; reading works without it.
-
----
-
-## 1. Environment setup (main app)
-
-```bash
-git clone <your-repo-url>
-cd "novel reader"
-
-# Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install the main app dependencies (lightweight — no ML libs)
-pip install -r requirements.txt
-```
-
-Copy the example environment file and edit as needed:
-
-```bash
-cp .env.example .env
-```
-
-Key variables (see `.env.example` for the full list):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DATABASE_URL` | `postgresql://novel_reader:changeme@localhost:5432/novel_reader` | PostgreSQL for the parser |
-| `ENABLE_NOVEL_PARSING` | `false` | Turn on automatic parsing after upload |
-| `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` | `ollama` / local | LLM used for parsing |
-| `VOICE_SAMPLES_DIR` | `./voice_samples` | Reference voice clips |
-| `TTS_SERVICE_URL` | `http://localhost:8070` | Where the TTS service lives |
-| `TTS_DEFAULT_NARRATOR_ACTOR` | `Sohee` | Narration voice when no narrator is assigned |
-| `TTS_DEVICE` | `cuda` | TTS container device (`cuda` / `mps` / `cpu`) |
-| `TTS_PORT` | `8070` | Host port the TTS container publishes |
-
----
-
-## 2. PostgreSQL (parsing backend)
-
-Only needed if you want parsing and TTS (TTS reads the parsed dialogue).
-
-```bash
-docker compose up -d postgres
-```
-
-This starts PostgreSQL 17 with the credentials from `.env` (defaults match the
-default `DATABASE_URL`). The schema is created automatically by the app on first
-use.
-
-To use Supabase instead of local Postgres, set `DATABASE_URL` to your Supabase
-pooler URL and `POSTGRES_SSL=require` in `.env`.
-
----
-
-## 3. TTS service (Chatterbox-Turbo, GPU)
-
-The TTS service lives in `tts_service/` and is built from the local Chatterbox
-source in `chatterbox-trying/chatterbox`.
-
-### Option A — Docker Compose (recommended)
-
-```bash
-# Build + start the GPU TTS container
-docker compose up -d --build tts
-
-# Watch the logs (first start downloads the model weights from HuggingFace)
-docker compose logs -f tts
-
-# Verify it's healthy
-curl http://localhost:8070/health
-# {"status":"ok","loaded":true,"device":"cuda","sample_rate":24000}
-```
-
-The compose service mounts:
-
-- `./voice_samples` → `/voice_samples` (read-only voice references)
-- `./data/tts_cache` → `/data/tts_cache` (generated audio cache, survives restarts)
-- `./data/hf` → `/data/hf` (HuggingFace model cache)
-
-> **GPU note:** the `tts` service reserves all NVIDIA GPUs via the compose
-> `deploy.resources` block and requires the NVIDIA Container Toolkit. If you have
-> no GPU, set `TTS_DEVICE=cpu` in `.env` and remove the `deploy:` block from the
-> `tts` service in `docker-compose.yml` (generation will be slow).
-
-### Option B — Local process (no Docker)
-
-Use a **separate** virtual environment for the TTS service so its pinned ML
-dependencies don't clash with the main app:
-
-```bash
-python3 -m venv .venv-tts
-source .venv-tts/bin/activate
-
-# Install Chatterbox (pulls torch==2.6.0, transformers==5.2.0, …) + web layer
-pip install ./chatterbox-trying/chatterbox
-pip install -r tts_service/requirements.txt
-
-# Run the service
-export TTS_DEVICE=cuda            # or mps / cpu
-export VOICE_SAMPLES_DIR=./voice_samples
-export TTS_CACHE_DIR=./data/tts_cache
-uvicorn tts_service.server:app --host 0.0.0.0 --port 8070
-```
-
----
-
-## 4. Run the main app
-
-```bash
-source .venv/bin/activate
-python app.py
-```
-
-Open **http://127.0.0.1:8060** — it redirects to the dashboard.
-
-Typical full-stack startup:
-
-```bash
-docker compose up -d postgres tts     # databases + TTS service
-source .venv/bin/activate
-python app.py                          # main app
-```
-
----
-
-## Usage
-
-1. **Upload** a `.txt`, `.epub`, or `.pdf` from the dashboard.
-2. If `ENABLE_NOVEL_PARSING=true`, parsing runs in the background: it extracts
-   characters, attributes dialogue, tags emotions, and assigns each character a
-   voice actor from `voice_samples/`.
-3. Open the book in the reader.
-4. Click the **speaker icon** in the top bar (between *Dashboard* and *Back*) to
-   start narration:
-   - reading begins at your current chapter and **auto-advances** to the next,
-   - the **current line is highlighted** and the page **auto-scrolls**,
-   - upcoming lines are **prefetched** in a sliding window that tracks the
-     playback head (spilling into the next chapter near a boundary) for near
-     real-time playback — tune the depth with `TTS_LOOKAHEAD` (default `4`),
-   - click the icon again to stop.
-5. If a chapter isn't parsed yet, a small **"Parsing in progress…"** toast
-   appears and fades after a few seconds.
-
----
-
-## Voice samples
-
-Voice references live in `voice_samples/<Actor>/<Actor>_<emotion>_<intensity>.wav`,
-e.g. `Vivian/Vivian_happy_high.wav`. Nine actors ship by default (Aiden, Dylan,
-Eric, Ono_Anna, Ryan, Serena, Sohee, Uncle_Fu, Vivian).
-
-> Chatterbox-Turbo requires each reference clip to be **longer than 5 seconds**.
-> Shorter clips error and that line is skipped during narration.
-
-Emotion is conveyed two ways: the parser picks the matching emotion/intensity
-sample file, **and** it injects paralinguistic tags (`[laugh]`, `[sigh]`,
-`[chuckle]`, …) into the text — these are native to the Turbo model.
-
----
-
-## Deploying TTS to Modal (later)
-
-The same engine and FastAPI app are reused by `tts_service/modal_app.py`:
-
-```bash
-pip install modal
-modal deploy tts_service/modal_app.py
-```
-
-Modal prints a public URL. Point the main app at it with no code changes:
-
-```bash
-# in .env
-TTS_SERVICE_URL=https://<your-workspace>--novel-reader-tts-ttsservice-fastapi-app.modal.run
-```
-
-Voice samples are baked into the Modal image; model weights and the audio cache
-persist in Modal Volumes.
-
----
+1. **Ingestion** (`novel_reader/ingestion.py`) — the uploaded file is split into
+   chapters/sections and stored in SQLite. Reading works immediately, with or
+   without parsing.
+2. **Parsing** (`novel_parser/`) runs LLM passes:
+   - *Pass 1* extracts the cast of characters.
+   - *Pass 2* attributes each line of dialogue to a speaker, tags emotion/intensity, and injects paralinguistic cues (`[laugh]`, `[sigh]`, …).
+   - Voice actors are matched to characters from `voice_samples/`.
+3. **RAG** (`novel_rag/`) indexes the full text into Qdrant as overlapping chunks
+   with rich metadata (chapter serials, speakers, spoiler level). The retriever
+   is **temporal-aware** and never returns content past the reader's chapter.
+4. **Narration** (`novel_reader/tts.py`) builds a playlist of speakable units,
+   resolves each to `(text, voice_ref)`, and calls the TTS service. A sliding
+   prefetch window keeps upcoming lines synthesized ahead of the playback head
+   (tune the depth with `TTS_LOOKAHEAD`, default `4`).
+5. **Chat** (`novel_reader/chat.py`) answers as a character using only
+   spoiler-safe retrieved context, streaming the reply token-by-token.
 
 ## Project layout
 
 ```
-app.py                  FastAPI entrypoint: mounts Gradio apps + /tts routes
-docker-compose.yml      postgres + tts services
-requirements.txt        Main app (light) dependencies
-.env.example            All configuration variables
-
-novel_reader/           Reading app
-  ui.py                 Gradio UI, reader header, player JS/CSS
-  storage.py            SQLite library + sections + progress
-  ingestion.py          Upload → parse → store pipeline
-  tts.py                TTS orchestrator (playlist build + prefetch)
-  config.py             Paths + TTS settings
-
-novel_parser/           LLM parsing pipeline (PostgreSQL)
-  pipeline.py           Orchestrates passes
-  pass1_characters.py   Character extraction
-  pass2_dialogue.py     Dialogue attribution + emotion + tags
-  voice_actors.py       Voice-actor matching + sample resolution
-  database.py           PostgreSQL schema + queries
-
-tts_service/            Standalone Chatterbox-Turbo microservice
-  engine.py             Framework-agnostic TTS engine (model + cache)
-  server.py             FastAPI wrapper (/health, /synthesize)
-  modal_app.py          Modal deployment (reuses engine + server)
-  Dockerfile            GPU image
-  requirements.txt      Thin web-layer deps
-
-voice_samples/          Reference voice clips per actor/emotion
-data/                   SQLite DB, novel sources, caches
-chatterbox-trying/      Chatterbox source (installed into the TTS image)
+app.py                FastAPI entrypoint — mounts Gradio apps + /tts, /chat routes
+docker-compose.yml    postgres + qdrant + tts services
+novel_reader/         Reading app: UI, storage, ingestion, TTS + chat orchestration
+novel_parser/         LLM parsing pipeline (characters, dialogue, voices) → PostgreSQL
+novel_rag/            Temporal-aware, spoiler-safe RAG over Qdrant
+tts_service/          Standalone Chatterbox-Turbo microservice (Docker + Modal)
+voice_samples/        Reference voice clips per actor/emotion
+public/               Logo + theme assets
+data/                 SQLite DB, novel sources, model + audio caches
 ```
 
----
+## License
 
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| Speaker shows "TTS service is offline" | Ensure the `tts` container/process is up and `TTS_SERVICE_URL` is correct (`curl http://localhost:8070/health`). |
-| Speaker shows "Parsing in progress…" forever | The chapter isn't parsed yet. Ensure `ENABLE_NOVEL_PARSING=true`, Postgres is up, and the LLM is reachable. |
-| `docker compose up tts` fails on GPU | Install the NVIDIA Container Toolkit, or set `TTS_DEVICE=cpu` and drop the `deploy:` block. |
-| First TTS request is slow | The model downloads from HuggingFace on first run and loads into VRAM; subsequent requests are cached. |
-| `python: command not found` | Use `python3` (or activate the venv: `source .venv/bin/activate`). |
-|quering the vector db | run `./.venv/bin/python -m novel_rag.query <uuid> -c <chapter number> --full "your query"`
+[MIT](LICENSE)
